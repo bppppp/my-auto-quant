@@ -180,6 +180,7 @@ def translate(
     smoke_universe: Optional[list[str]] = None,
     smoke_start: str = "2024-06-01",
     smoke_end: str = "2024-06-30",
+    smoke_timeout: int = 600,
     on_test_fail=None,  # 回调: (attempt, code_path, test_result) -> bool (True=已修好, False=放弃)
 ) -> TranslationResult:
     """翻译 spec → strategy.py.
@@ -197,6 +198,7 @@ def translate(
         max_attempts: 最多尝试次数 (默认 10)
         smoke_universe: 5 股 smoke test
         smoke_start / smoke_end: smoke 日期
+        smoke_timeout: smoke backtest 超时秒数 (默认 600, 由 config.smoke_timeout 覆盖)
         on_test_fail: 测试失败时的回调函数
             签名: (attempt: int, code_path: Path, test_result: TestResult) -> bool
             返回 True = 已修好 (重测), False = 放弃
@@ -225,6 +227,7 @@ def translate(
     log.info(f"  spec: {spec_path}")
     log.info(f"  code: {code_path}")
     log.info(f"  max_attempts: {max_attempts}")
+    log.info(f"  smoke_timeout: {smoke_timeout}s")
 
     system_prompt = load_system_prompt()
     llm = get_llm(temperature=0.3, enable_thinking=True)
@@ -258,6 +261,7 @@ def translate(
             smoke_universe=smoke_universe,
             smoke_start=smoke_start,
             smoke_end=smoke_end,
+            timeout=smoke_timeout,
         )
 
         if test_result.passed:

@@ -313,6 +313,9 @@ def _run_generate_once(*, max_retries: int, round_no: int) -> Path:
         log_print(f"[generate] → 跑硬校验(模式 generate: 22 硬 + 1 软)...")
         fm = data["frontmatter"]
         body = data["strategy_narrative"]
+        # 若 LLM 按新 prompt 只在顶层写 test_universe,frontmatter 这边缺失
+        # 注入（仅在 frontmatter 缺时填充,已有则保留 LLM 写的值）
+        fm.setdefault("test_universe", data["test_universe"])
         errors = validate_md_structure(fm, body, mode="generate")
         hard_errs = [e for e in errors if not str(e.code).endswith("-soft")]
         soft_errs = [e for e in errors if str(e.code).endswith("-soft")]

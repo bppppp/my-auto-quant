@@ -2,14 +2,16 @@
 pipeline.config — 流水线运行时配置
 
 所有路径相对项目根 (my-quant3/), 跨电脑可移植。
-环境变量覆盖优先级最高。
+
+覆盖顺序 (从高到低):
+  1. CLI 标志 (--generate-timeout / --backtest-timeout / ...)
+  2. PipelineConfig 代码内默认值 (本文件)
+  注: 不从 .env 读 (避免与根 config.py 的 .env 加载逻辑冲突)
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 # autoRun/pipeline/config.py → autoRun/pipeline/ → autoRun/ → my-quant3/
 _PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
@@ -37,7 +39,7 @@ def result_dir() -> Path:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """流水线配置 (用户确认)."""
+    """流水线配置 (代码默认值, 可被 CLI 标志覆盖)."""
 
     batch_size: int = 5
     params_rounds: int = 20                   # 用户确认: 20 轮
@@ -51,9 +53,20 @@ class PipelineConfig:
         "000001.SZ", "000002.SZ", "600000.SH", "600519.SH", "000333.SZ",
     )
     smoke_start: str = "2024-06-01"
-    smoke_end: str = "2024-06-30"
+    smoke_end: str = "2024-12-31"
 
-    # 路径 (相对项目根, 可通过 env 覆盖为绝对路径)
+    # ===== 各阶段 subprocess timeout (秒) =====
+    # Stage A (generate) 包含 quality_eval,可能需要 1 - 5 小时
+    # None 表示不设超时 (依赖外部 Ctrl+C)
+    generate_timeout: int | None = 18000      # 5 小时 (用户确认)
+    # Stage C/E 调 optimize / factor_weights (单次 LLM 调优)
+    cli_timeout: int | None = 1800            # 30 分钟
+    # 单次回测 (params / weight)
+    backtest_timeout: int | None = 3600       # 1 小时 (用户确认)
+    # 翻译阶段 smoke backtest (5 只股票, 1 个月)
+    smoke_timeout: int = 600                  # 10 分钟
+
+    # 路径 (相对项目根, 可被 CLI 覆盖)
     result_dir: Path = field(default=None)  # type: ignore
 
     def __post_init__(self):
@@ -61,22 +74,6 @@ class PipelineConfig:
             object.__setattr__(self, "result_dir", _PROJECT_ROOT / "result")
         elif not self.result_dir.is_absolute():
             object.__setattr__(self, "result_dir", _PROJECT_ROOT / self.result_dir)
-
-    @classmethod
-    def from_env(cls) -> "PipelineConfig":
-        """从环境变量构造 (覆盖默认值)."""
-        kwargs: dict[str, Any] = {}
-        if v := os.getenv("PIPELINE_BATCH_SIZE"):
-            kwargs["batch_size"] = int(v)
-        if v := os.getenv("PIPELINE_PARAMS_ROUNDS"):
-            kwargs["params_rounds"] = int(v)
-        if v := os.getenv("PIPELINE_WEIGHT_ROUNDS"):
-            kwargs["weight_rounds"] = int(v)
-        if v := os.getenv("PIPELINE_TRANSLATE_MAX_ATTEMPTS"):
-            kwargs["translate_max_attempts"] = int(v)
-        if v := os.getenv("PIPELINE_RESULT_DIR"):
-            kwargs["result_dir"] = Path(v)
-        return cls(**kwargs)
 
 
 __all__ = [

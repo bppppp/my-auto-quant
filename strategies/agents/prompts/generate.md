@@ -32,11 +32,11 @@
 | # | 规则 | 失败代码 |
 |---|------|---------|
 | 1 | JSON 顶层必须含 `name` / `test_universe` / `frontmatter` / `strategy_narrative` 4 个字段 | 解析失败 |
-| 2 | `frontmatter` 必含 6 块:`targets`(5 项) / `factors` / `entry_signals` / `exit_signals` / `position_weights` / `params` | #2-#10 |
+| 2 | `frontmatter` 必含 6 块:`targets`(5 项) / `factors` / `entry_signals` / `exit_signals` / `position_weights` / `params`（`test_universe` **可省略**——省略时由代码自动从顶层注入）| #2-#10 |
 | 3 | `targets.annual_return > 0.20` 且 `annual_return / abs(max_drawdown) ≥ 1.0` | #21, #22 |
 | 4 | `strategy_narrative` ≥ **1500 字符**,必含 6 节 | #14, #15 |
 | 5 | 6 节标题**逐字**用 `### 1.` `### 2.` ... `### 6.`（阿拉伯数字 + 英文句点）| #15 |
-| 6 | `test_universe` 仅允许 `HS300` / `CSI1000` / `CYB_STAR_50`（大写），1~3 个元素 | #3 |
+| 6 | `test_universe` 在**顶层**写 1 份即可（list，1~3 元素，元素**仅允许** `HS300` / `CSI1000` / `CYB_STAR_50` **大写**）。 |
 | 7 | `trigger` 数字除 0/1/100/1000 外必须 param 化（用 `{param_name}` 引用） | #23, #19 |
 | 8 | `{param_name}` 必须是 `params[].name`,不能引用因子名 / 结构名 | #19 |
 
@@ -57,7 +57,6 @@
       "max_drawdown": -0.15,
       "description": "双均线交叉 + ATR 波动率扩张 + 量能确认。期望 22% / 胜率 48% / 盈亏比 2.3 / 夏普 1.3 / 回撤 15%。"
     },
-    "test_universe": ["HS300"],
     "factors": [
       {"name": "ma_5", "description": "5 日简单移动平均线", "calculation": "mean(close, 5)"},
       {"name": "ma_20", "description": "20 日简单移动平均线", "calculation": "mean(close, 20)"},

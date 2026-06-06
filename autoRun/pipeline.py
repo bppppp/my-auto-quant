@@ -123,10 +123,19 @@ def rename_strategy_dir(old_name: str, new_name: str) -> Path:
 # ========== Stage A: 生成新策略 ==========
 
 def run_stage_a_generate(config: PipelineConfig) -> str:
-    """Stage A: 调 strategies.py generate, 自动解决命名冲突."""
+    """Stage A: 调 strategies.py generate, 自动解决命名冲突.
+
+    generate 含 quality_eval,可能耗时 30 分钟 - 1+ 小时,timeout 由 config.generate_timeout 控制.
+    设置为 None 表示不设超时 (依赖外部 Ctrl+C).
+    """
     cmd = [sys.executable, "strategies/strategies.py", "generate"]
-    log.info(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=project_root(), capture_output=True, text=True, timeout=600)
+    timeout_str = f"{config.generate_timeout}s" if config.generate_timeout is not None else "无限制"
+    log.info(f"  $ {' '.join(cmd)}  (timeout={timeout_str})")
+    result = subprocess.run(
+        cmd, cwd=project_root(), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=config.generate_timeout,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"generate exit {result.returncode}\nSTDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}")
 
@@ -150,12 +159,14 @@ def run_stage_a_generate(config: PipelineConfig) -> str:
 def run_stage_b_translate(name: str, config: PipelineConfig) -> Path:
     """Stage B: 翻译 spec → strategy.py."""
     spec_path = subjects_dir() / name / f"{name}_original.md"
+    log.info(f"  → 翻译 {name} (max_attempts={config.translate_max_attempts}, smoke_timeout={config.smoke_timeout}s)")
     result = translate(
         spec_path=spec_path,
         max_attempts=config.translate_max_attempts,
         smoke_universe=list(config.smoke_universe),
         smoke_start=config.smoke_start,
         smoke_end=config.smoke_end,
+        smoke_timeout=config.smoke_timeout,
     )
     return result.code_path
 
@@ -168,7 +179,7 @@ def run_stage_c_params_loop(name: str, config: PipelineConfig, state: State) -> 
     for round_n in range(1, config.params_rounds + 1):
         log.info(f"  [params {round_n}/{config.params_rounds}]")
         try:
-            run_backtest(name, mode="params")
+            run_backtest(name, mode="params", timeout=config.backtest_timeout)
             metrics = parse_latest(name, mode="params")
             if metrics:
                 state.record_params(name, round_n, metrics)
@@ -181,7 +192,7 @@ def run_stage_c_params_loop(name: str, config: PipelineConfig, state: State) -> 
 
         if round_n < config.params_rounds:
             try:
-                run_cli("optimize", [name, "once"])
+                run_cli("optimize", [name, "once"], timeout=config.cli_timeout)
             except Exception as e:
                 log.warning(f"  [params {round_n}] optimize 失败: {e}")
     state.set_stage(name, STAGE_PARAMS_DONE)
@@ -234,7 +245,7 @@ def run_stage_e_weight_loop(name: str, config: PipelineConfig, state: State) -> 
     for round_n in range(1, config.weight_rounds + 1):
         log.info(f"  [weight {round_n}/{config.weight_rounds}]")
         try:
-            run_backtest(name, mode="weight")
+            run_backtest(name, mode="weight", timeout=config.backtest_timeout)
             metrics = parse_latest(name, mode="weight")
             if metrics:
                 state.record_weight(name, round_n, metrics)
@@ -247,7 +258,7 @@ def run_stage_e_weight_loop(name: str, config: PipelineConfig, state: State) -> 
 
         if round_n < config.weight_rounds:
             try:
-                run_cli("factor_weights", [name, "once"])
+                run_cli("factor_weights", [name, "once"], timeout=config.cli_timeout)
             except Exception as e:
                 log.warning(f"  [weight {round_n}] factor_weights 失败: {e}")
     state.set_stage(name, STAGE_WEIGHT_DONE)
@@ -305,11 +316,16 @@ def run_stage_h_export(name: str, config: PipelineConfig, state: State) -> None:
 
 # ========== Subprocess 辅助 ==========
 
-def run_cli(subcommand: str, args: list[str], timeout: int = 600) -> None:
-    """调 strategies.py 子命令 (generate/optimize/factor_weights/list)."""
+def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> None:
+    """调 strategies.py 子命令 (generate/optimize/factor_weights/list).
+
+    Args:
+        timeout: 子进程超时秒数,None 表示不设超时 (依赖外部 Ctrl+C).
+    """
     cmd = [sys.executable, "strategies/strategies.py", subcommand] + args
-    log.info(f"    $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=project_root(), capture_output=True, text=True, timeout=timeout)
+    timeout_str = f"{timeout}s" if timeout is not None else "无限制"
+    log.info(f"    $ {' '.join(cmd)}  (timeout={timeout_str})")
+    result = subprocess.run(cmd, cwd=project_root(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(
             f"{subcommand} exit {result.returncode}\n"
@@ -317,8 +333,12 @@ def run_cli(subcommand: str, args: list[str], timeout: int = 600) -> None:
         )
 
 
-def run_backtest(name: str, mode: str, timeout: int = 900) -> None:
-    """调 subject.cli run 跑 backtest."""
+def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
+    """调 subject.cli run 跑 backtest.
+
+    Args:
+        timeout: 子进程超时秒数,None 表示不设超时.
+    """
     cmd = [
         sys.executable, "-m", "subject.cli", "run",
         "--strategy", name,
@@ -326,9 +346,10 @@ def run_backtest(name: str, mode: str, timeout: int = 900) -> None:
     ]
     if mode == "weight":
         cmd += ["--weight-test", name]
-    log.info(f"    $ {' '.join(cmd)} (cwd=subjects/)")
+    timeout_str = f"{timeout}s" if timeout is not None else "无限制"
+    log.info(f"    $ {' '.join(cmd)} (cwd=subjects/, timeout={timeout_str})")
     result = subprocess.run(
-        cmd, cwd=subjects_dir(), capture_output=True, text=True, timeout=timeout
+        cmd, cwd=subjects_dir(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -554,6 +575,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="只显示计划不执行")
     parser.add_argument("--auto", action="store_true", help="无人值守模式, 连续失败不暂停")
     parser.add_argument("--result-dir", default=None, help="覆盖 result 输出目录")
+    # 各阶段 timeout (秒),传 0 表示禁用 timeout
+    parser.add_argument("--generate-timeout", type=int, default=None, help="策略生成 timeout (秒, 默认 18000/5h, 0=禁用)")
+    parser.add_argument("--cli-timeout", type=int, default=None, help="optimize/factor_weights timeout (秒, 默认 1800/30m, 0=禁用)")
+    parser.add_argument("--backtest-timeout", type=int, default=None, help="单次回测 timeout (秒, 默认 3600/1h, 0=禁用)")
+    parser.add_argument("--smoke-timeout", type=int, default=None, help="翻译 smoke backtest timeout (秒, 默认 600/10m)")
 
     # check-env 子命令
     sub.add_parser("check-env", help="检查环境是否就绪")
@@ -579,7 +605,15 @@ def main(argv: list[str] | None = None) -> int:
         overrides["translate_max_attempts"] = args.translate_max
     if args.result_dir:
         overrides["result_dir"] = Path(args.result_dir)
-    config = PipelineConfig(**overrides) if overrides else PipelineConfig.from_env()
+    if args.generate_timeout is not None:
+        overrides["generate_timeout"] = args.generate_timeout if args.generate_timeout > 0 else None
+    if args.cli_timeout is not None:
+        overrides["cli_timeout"] = args.cli_timeout if args.cli_timeout > 0 else None
+    if args.backtest_timeout is not None:
+        overrides["backtest_timeout"] = args.backtest_timeout if args.backtest_timeout > 0 else None
+    if args.smoke_timeout is not None:
+        overrides["smoke_timeout"] = args.smoke_timeout
+    config = PipelineConfig(**overrides) if overrides else PipelineConfig()
 
     if args.dry_run:
         banner("my-quant3 pipeline 计划 (dry-run)", char="━")
@@ -589,6 +623,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  translate_max_attempts: {config.translate_max_attempts}")
         print(f"  result_dir: {config.result_dir}")
         print(f"  smoke_universe: {config.smoke_universe}")
+        # 各阶段 timeout
+        def _fmt(t):
+            if t is None:
+                return "无限制 (依赖外部 Ctrl+C)"
+            if t >= 60:
+                return f"{t}s ({t/3600:.1f}h)"
+            return f"{t}s"
+        print(f"  generate_timeout:    {_fmt(config.generate_timeout)}")
+        print(f"  cli_timeout:         {_fmt(config.cli_timeout)}")
+        print(f"  backtest_timeout:    {_fmt(config.backtest_timeout)}")
+        print(f"  smoke_timeout:       {_fmt(config.smoke_timeout)}")
         return 0
 
     banner("my-quant3 pipeline 启动", char="=")
