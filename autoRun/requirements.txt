@@ -1,0 +1,15 @@
+# my-quant3 autoRun 流水线依赖
+# 跨电脑部署: pip install -r autoRun/requirements.txt
+
+# LLM 客户端
+openai>=1.0.0
+
+# 文件监听 (subject/cli/main.py + strategy.py monitor 模式)
+watchdog>=3.0.0
+
+# YAML 解析 (frontmatter)
+pyyaml>=6.0
+
+# 数据处理 (回测引擎)
+pandas>=2.0.0
+numpy>=1.24.0
