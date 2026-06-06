@@ -545,15 +545,16 @@ class _OpenAIChat:
         #                   + {"reasoning_effort": "low"|"medium"|"high"|"max"}
         #   - MiniMax:      {"thinking": {"type": "adaptive" | "disabled"}}
         #                   (用 "enabled" 会被 API 拒 400,且不支持 reasoning_effort)
-        # 切换 provider 只改 .env,不改代码:
-        #   DeepSeek  →  LLM_THINKING_TYPE=enabled  LLM_REASONING_EFFORT=high
-        #   MiniMax    →  LLM_THINKING_TYPE=adaptive LLM_REASONING_EFFORT=  (留空)
+        # 切换 provider 只改 .env 的 LLM_ENABLE_THINKING,不改代码:
+        #   DeepSeek  →  LLM_ENABLE_THINKING=enabled   LLM_REASONING_EFFORT=high
+        #   MiniMax   →  LLM_ENABLE_THINKING=adaptive  LLM_REASONING_EFFORT=  (留空)
+        #   关闭        →  LLM_ENABLE_THINKING=disabled
         extra_body = kwargs.setdefault("extra_body", {})
-        think_on_type = self.settings.thinking_type or "enabled"
-        think_off_type = "disabled"
-        extra_body["thinking"] = (
-            {"type": think_on_type} if self.settings.enable_thinking else {"type": think_off_type}
-        )
+        # LLM_ENABLE_THINKING 现在直接是 thinking.type 的值
+        # - 空字符串 → 不发送 thinking 字段
+        # - 其他值   → 发送 {"type": <值>}
+        if self.settings.thinking_type:
+            extra_body["thinking"] = {"type": self.settings.thinking_type}
         # reasoning_effort 仅在非空时传(MiniMax 不支持)
         if self.settings.reasoning_effort:
             extra_body["reasoning_effort"] = self.settings.reasoning_effort
@@ -563,7 +564,7 @@ class _OpenAIChat:
         log_print(
             f"[LLM] → 调用开始 | model={self.model} | "
             f"temperature={self.settings.temperature} | max_tokens={self.settings.max_tokens} | "
-            f"think={self.settings.enable_thinking} (type={think_on_type if self.settings.enable_thinking else think_off_type}) | "
+            f"thinking.type={self.settings.thinking_type or '(not sent)'} | "
             f"reasoning_effort={self.settings.reasoning_effort or '(none)'} | "
             f"system_prompt={sys_p_len} 字符, user_prompt={usr_p_len} 字符"
         )

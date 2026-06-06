@@ -30,12 +30,14 @@ class LLMSettings:
     temperature: float
     max_tokens: int
     timeout: int
-    enable_thinking: bool = False
-    # 不同 provider 的 thinking.type 取值不同:
-    #   DeepSeek V4: "enabled" / "disabled"
-    #   MiniMax:     "adaptive" / "disabled"  (用 "enabled" 会被 API 拒 400)
-    # 切换 provider 时只需在 .env 改 LLM_THINKING_TYPE,不改代码。
-    thinking_type: str = "adaptive"
+    enable_thinking: bool = True
+    # thinking.type 的直接值(由 LLM_ENABLE_THINKING 决定,见 get_llm_settings):
+    #   - "enabled"   — DeepSeek V4 风格
+    #   - "adaptive"  — MiniMax 风格
+    #   - "disabled"  — 关闭
+    #   - "" (空)     — 不发送 thinking 字段
+    # 切换 provider 时只需改 .env 的 LLM_ENABLE_THINKING,不改代码。
+    thinking_type: str = "enabled"
     # DeepSeek 思考强度:low|medium|high|max;空字符串=不传该字段(MiniMax 不支持,留空)
     reasoning_effort: str = "high"
 
@@ -54,14 +56,22 @@ class LLMSettings:
 def get_llm_settings(
     *,
     temperature: float | None = None,
-    enable_thinking: bool = False,
+    enable_thinking: bool = True,
 ) -> LLMSettings:
     """根据环境变量构造 LLMSettings。
 
+    LLM_ENABLE_THINKING 现在直接作为 thinking.type 的值传入 API:
+      "" (空/未设)               → 用 LLM_THINKING_TYPE 兜底, 再不行用 caller 的 enable_thinking
+      "0" / "false" / "no"       → 关闭: type="disabled"
+      "1" / "true" / "yes"       → 开启: type="enabled" (DeepSeek 风格)
+      "enabled"                  → 开启: type="enabled"
+      "disabled"                 → 关闭: type="disabled"
+      "adaptive"                 → 开启: type="adaptive" (MiniMax 风格, "enabled" 会被拒 400)
+      其他非空字符串              → 直接作为 type 值 (高级, 自行保证 provider 支持)
+
     Args:
-        temperature: 覆盖默认温度（None = 走环境变量默认）
-        enable_thinking: 是否启用 think 模式（generate 持续开启 / mode 2/3 周期开启）。
-                         可被 LLM_ENABLE_THINKING env 覆盖(0=强制关, 1=强制开)
+        temperature: 覆盖默认温度(None = 走环境变量默认)
+        enable_thinking: caller 期望是否启用 think(仅在 LLM_ENABLE_THINKING 未设时生效)
     """
     # 延迟导入避免循环:根 config.py 在项目根,本文件 strategies/config.py 在 strategies/
     # 路径深度:strategies/config.py → strategies/ → my-quant3/(=parent.parent)
@@ -84,14 +94,33 @@ def get_llm_settings(
 
     api_key = LLM_API_KEY or require_api_key()
 
-    # env override for think mode
-    env_think = os.getenv("LLM_ENABLE_THINKING")
-    if env_think is not None:
-        if env_think in ("0", "false", "False", "no", "NO"):
+    # === 思考模式: LLM_ENABLE_THINKING 直接作为 thinking.type 值 ===
+    env_think_raw = os.getenv("LLM_ENABLE_THINKING", "")
+    env_think = env_think_raw.strip()
+    env_legacy_type = os.getenv("LLM_THINKING_TYPE")
+
+    if env_think:
+        # 主路径: LLM_ENABLE_THINKING 直接作为 thinking.type 值
+        normalized = env_think.lower()
+        if normalized in ("0", "false", "no", "disabled"):
+            thinking_type_value = "disabled"
             enable_thinking = False
-        elif env_think in ("1", "true", "True", "yes", "YES"):
+        elif normalized in ("1", "true", "yes", "enabled"):
+            thinking_type_value = "enabled"
             enable_thinking = True
-        # other values: keep the caller's value
+        else:
+            # 直接当 type 值用, 如 "adaptive" (MiniMax) 或自定义
+            # 规范化为小写(API 通常要求小写, 也避免 "ENABLED" / "Adaptive" 之类的大小写差异)
+            thinking_type_value = normalized
+            enable_thinking = True
+    elif env_legacy_type is not None:
+        # 向后兼容: 旧版用 LLM_THINKING_TYPE
+        # 切换到新版后, LLM_ENABLE_THINKING 应该优先生效
+        thinking_type_value = env_legacy_type.lower()
+        enable_thinking = env_legacy_type.lower() != "disabled"
+    else:
+        # 兜底: 用 caller 的 enable_thinking, 默认 type
+        thinking_type_value = "enabled" if enable_thinking else "disabled"
 
     return LLMSettings(
         base_url=os.getenv("LLM_BASE_URL", LLM_BASE_URL),
@@ -101,7 +130,7 @@ def get_llm_settings(
         max_tokens=int(os.getenv("LLM_MAX_TOKENS", str(MAX_TOKENS))),
         timeout=int(os.getenv("LLM_TIMEOUT", str(TIMEOUT))),
         enable_thinking=enable_thinking,
-        thinking_type=os.getenv("LLM_THINKING_TYPE", "adaptive"),
+        thinking_type=thinking_type_value,
         reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "high"),
     )
 
