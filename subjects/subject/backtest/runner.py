@@ -42,7 +42,7 @@ from .portfolio import (
 from .reports import render_params_report, render_weight_report
 from .signals import rank_top_n
 from .stats import compute_factor_value_stats, compute_signal_stats
-from .universe import HS300_CODES, exclude_bj, exclude_st
+from .universe import HS300_CODES, CSI1000_CODES, CYB_STAR_50_CODES, exclude_bj, exclude_st
 
 
 # 模式 → 数据源
@@ -146,7 +146,7 @@ class BacktestRunner:
         if self.test_universe_override is not None:
             self.logger.info(f"test_universe: 自定义 {len(self.test_universe_override)} 只")
         else:
-            self.logger.info(f"test_universe: spec.test_universe (默认 hs300)")
+            self.logger.info(f"test_universe: spec.test_universe (默认 HS300)")
         if self.max_stocks is not None:
             self.logger.info(f"max_stocks (limit): {self.max_stocks}")
         self.logger.info(f"actual universe size: {len(self.universe)}")
@@ -216,10 +216,39 @@ class BacktestRunner:
         return best
 
     def _resolve_universe(self) -> list[str]:
+        """从 spec.test_universe 解析股票代码列表.
+
+        支持的 test_universe 值 (大小写不敏感, 但建议用大写):
+          - "HS300" / "hs300"   → 沪深 300 (300 只)
+          - "CSI1000" / "csi1000" → 中证 1000 (1000 只)
+          - "CYB_STAR_50" / "cyb_star_50" → 创业板 50 + 科创板 50 (~100 只)
+
+        多选: ["HS300", "CSI1000"] → 取并集 (去重).
+
+        无效值或全空 → fallback 沪深 300.
+        """
         u = self.spec.get("test_universe", [])
-        if "hs300" in u:
-            return list(HS300_CODES)
-        return list(HS300_CODES)
+        # 大小写归一化
+        uni_set = {str(x).strip().upper() for x in u if x}
+        codes: set[str] = set()
+        if "HS300" in uni_set:
+            codes.update(HS300_CODES)
+        if "CSI1000" in uni_set:
+            codes.update(CSI1000_CODES)
+        if "CYB_STAR_50" in uni_set:
+            codes.update(CYB_STAR_50_CODES)
+        if not codes:
+            # fallback: 默认沪深 300 (兼容旧的空 / 非法值)
+            codes.update(HS300_CODES)
+        # 保持稳定顺序: HS300 -> CSI1000 -> CYB_STAR_50
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for pool in (HS300_CODES, CSI1000_CODES, CYB_STAR_50_CODES):
+            for c in pool:
+                if c in codes and c not in seen:
+                    ordered.append(c)
+                    seen.add(c)
+        return ordered
 
     # ===== 主入口 =====
     def run(self) -> RunResults:
@@ -889,7 +918,7 @@ class BacktestRunner:
         if self.test_universe_override is not None:
             tu_desc = f"自定义 {len(self.test_universe_override)} 只"
         else:
-            tu_desc = f"spec.test_universe ({len(self.universe)} 只, 默认 hs300)"
+            tu_desc = f"spec.test_universe ({len(self.universe)} 只, 默认 HS300)"
         # 实际跑了多少 (受 max_stocks 影响)
         actual_size = len(self.universe)
         if self.max_stocks is not None and self.max_stocks < actual_size:

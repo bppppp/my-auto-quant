@@ -2,13 +2,13 @@
 
 **strategy**: ma_cross_atr_volume
 **version**: v18
-**date**: 2026-06-06 17:14:52
+**date**: 2026-06-06 20:55:36
 
 ## 测试条件
 
 | 中文名 | 英文名 | 值 |
 |---|---|---|
-| 测试集 | test_universe | 自定义 5 只 |
+| 测试集 | test_universe | spec.test_universe (5 只, 默认 HS300) |
 | 实际测试股票数 | universe_size | 5 |
 | 测试起始日期 | start_date | 2024-06-01 |
 | 测试结束日期 | end_date | 2024-06-30 |

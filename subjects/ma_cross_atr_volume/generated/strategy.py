@@ -85,7 +85,7 @@ class StrategyConfig:
 
     Attributes:
         test_universe: 自定义测试股票代码列表 (带后缀, 如 ``["000001.SZ", "600000.SH"]``).
-            None = 用 spec.test_universe (默认 hs300).
+            None = 用 spec.test_universe (默认 HS300).
         start_date: 测试起始日期 ``"YYYY-MM-DD"`` (含). None = 不限.
         end_date: 测试结束日期 ``"YYYY-MM-DD"`` (含). None = 不限.
         limit: 限制测试股票数 (取前 N). None = 不限.

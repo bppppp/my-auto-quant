@@ -8,7 +8,7 @@ targets:
   max_drawdown: -0.18
   description: 基于Donchian通道突破+成交量放大+趋势与RSI过滤，配合多级止损的中周期波段策略。目标年化25%，胜率45%，盈亏比3.5，夏普1.3，最大回撤18%。
 test_universe:
-- hs300
+- HS300
 factors:
 - name: donchian_high_20
   description: 20日最高价，Donchian通道上轨，突破关键阻力

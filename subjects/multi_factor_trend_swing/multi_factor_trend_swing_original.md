@@ -8,7 +8,7 @@ targets:
   max_drawdown: -0.12
   description: 基于多因子（均线趋势、ATR波动、量能、动量、RSI）过滤的中期波段策略。目标年化22%，胜率52%，盈亏比2.9，夏普1.35，回撤12%。
 test_universe:
-- hs300
+- HS300
 factors:
 - name: ma_10
   description: 10日简单移动平均线

@@ -54,7 +54,7 @@ targets:
   max_drawdown: <目标最大回撤>
   description: <目标描述>
 test_universe:
-- <universe_name>          # 如 hs300
+- <universe_name>          # 如 HS300
 factors:
 - name: <factor_1>
   description: <中文描述>
@@ -186,7 +186,7 @@ v2+ 由外部调参模块**只修改** `params[i].default` 后另存为 v2.md，
 
 > **重要正交关系**：
 > - **数据源**（`data-by-stock` / `data-by-day`）↔ **运行模式**（params / weight）**硬绑定**，不可配置
-> - **测试集**（spec.frontmatter.`test_universe`，如 `hs300`）↔ **数据源** **完全正交**
+> - **测试集**（spec.frontmatter.`test_universe`，如 `HS300`）↔ **数据源** **完全正交**
 >   - 同一 spec 的 `test_universe` 在不同 mode 下含义不变（都是"测哪批股票"）
 >   - params 模式按 test_universe 逐股做时间序列回测；weight 模式按 test_universe 在每日横截面中做选股
 
@@ -354,7 +354,7 @@ CLI 层（`subject/cli/main.py`）：`--weight-test` 改为**可选**（default 
 2026-06-05 22:00:00 [INFO] === Log file: .../ma_cross_atr_volume/log/backtest_2026-06-05_220000.log ===
 2026-06-05 22:00:00 [INFO] === BacktestRunner init ===
 2026-06-05 22:00:00 [INFO] mode: params
-2026-06-05 22:00:00 [INFO] test_universe: spec.test_universe (默认 hs300)
+2026-06-05 22:00:00 [INFO] test_universe: spec.test_universe (默认 HS300)
 2026-06-05 22:00:00 [INFO] actual universe size: 5
 2026-06-05 22:00:00 [INFO] === params mode: processing 5 stocks ===
 2026-06-05 22:00:01 [INFO] [1/5] 000001.SZ: 1250 bars (2018-01-02 ~ 2026-05-14)
@@ -483,7 +483,7 @@ CONFIG = StrategyConfig(
 **优先级链**（高→低）：
 
 ```
-CONFIG (代码中)  >  CLI 参数  >  spec 默认值 (test_universe: hs300)
+CONFIG (代码中)  >  CLI 参数  >  spec 默认值 (test_universe: HS300)
 ```
 
 **CONFIG 4 字段与 runner 参数的对应**：
@@ -510,7 +510,7 @@ python strategy.py --start-date 2024-09-01 --end-date 2024-09-30
 if self.test_universe_override is not None:
     self.universe = list(self.test_universe_override)   # 最高
 else:
-    self.universe = self._resolve_universe()             # 从 spec 解析 (hs300 → HS300_CODES)
+    self.universe = self._resolve_universe()             # 从 spec 解析 (HS300 → HS300_CODES)
 if self.max_stocks is not None:
     self.universe = self.universe[: self.max_stocks]      # 最后截前 N
 ```
@@ -526,7 +526,7 @@ CONFIG = StrategyConfig(
     limit=None,
 )
 
-# 场景 2: 完整 benchmark —— 跑 hs300 全部 + 2024 全年
+# 场景 2: 完整 benchmark —— 跑 HS300 全部 + 2024 全年
 CONFIG = StrategyConfig(
     test_universe=None,
     start_date="2024-01-01",

@@ -8,7 +8,7 @@ targets:
   max_drawdown: -0.15
   description: 双均线交叉 + ATR 波动率扩张 + 量能确认。期望 22% / 胜率 48% / 盈亏比 2.3 / 夏普 1.3 / 回撤 15%。
 test_universe:
-- hs300
+- HS300
 factors:
 - name: ma_5
   description: 5 日简单移动平均线
