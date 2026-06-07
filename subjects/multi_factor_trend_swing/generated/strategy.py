@@ -105,8 +105,8 @@ class StrategyConfig:
 # === 在这里配置 (None = 不覆盖) ===
 CONFIG = StrategyConfig(
     test_universe=None,  # 例如: ["000001.SZ", "000002.SZ", "600000.SH", "600519.SH"]
-    start_date=None,      # 例如: "2024-01-01"
-    end_date=None,        # 例如: "2024-03-31"
+    start_date="2016-01-01",      # 例如: "2024-01-01"
+    end_date="2026-01-01",        # 例如: "2024-03-31"
     limit=None,           # 例如: 10 (调试时建议 5-10, 全跑慢)
 )
 
@@ -148,6 +148,32 @@ class Strategy:
         if factors["rsi_14"].iloc[-1] < params["rsi_upper"]:
             score += ew["rsi_filter"]
         return score
+
+    def get_triggered_signals(self, factors: dict, params: dict, weights: dict) -> list[str]:
+        """返回触发入场的信号名列表（供 runner 记录事件用）。
+
+        此方法的触发条件必须与 entry_score 中的条件保持一致。
+        """
+        triggered = []
+        # trend_strength: ma_10 > ma_30 AND ma_30 > ma_60
+        if (
+            factors["ma_10"].iloc[-1] > factors["ma_30"].iloc[-1]
+            and factors["ma_30"].iloc[-1] > factors["ma_60"].iloc[-1]
+        ):
+            triggered.append("trend_strength")
+        # atr_filter: atr_14 / close > atr_threshold
+        if factors["atr_14"].iloc[-1] / factors["close"].iloc[-1] > params["atr_threshold"]:
+            triggered.append("atr_filter")
+        # volume_confirm: volume_ratio_20 > vol_threshold
+        if factors["volume_ratio_20"].iloc[-1] > params["vol_threshold"]:
+            triggered.append("volume_confirm")
+        # momentum_filter: mom_60 > mom_threshold
+        if factors["mom_60"].iloc[-1] > params["mom_threshold"]:
+            triggered.append("momentum_filter")
+        # rsi_filter: rsi_14 < rsi_upper
+        if factors["rsi_14"].iloc[-1] < params["rsi_upper"]:
+            triggered.append("rsi_filter")
+        return triggered
 
     def should_exit(self, position: dict, factors: dict, params: dict, weights: dict) -> str | None:
         ew = weights["exit"]

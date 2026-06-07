@@ -81,7 +81,7 @@ def render_params_report(
     # Signal Stats
     lines.append("## Signal Stats")
     lines.append("")
-    lines.append("| signal | triggered | swallowed | skipped | win_count | win_rate | avg_return | median_holding_days |")
+    lines.append("| 信号名 | 触发次数 | 被吞次数 | 跳过次数 | 盈利次数 | 胜率 | 平均收益 | 中位持仓天数 |")
     lines.append("|---|---|---|---|---|---|---|---|")
     for s in signal_stats:
         lines.append(
@@ -90,10 +90,42 @@ def render_params_report(
         )
     lines.append("")
 
+    # 持仓天数分布
+    lines.append("## 持仓天数分布")
+    lines.append("")
+    lines.append("| 信号名 | ≤5天 | ≤10天 | ≤15天 | ≤20天 | ≤25天 | ≤30天 | >30天 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for s in signal_stats:
+        if s.holding_days_dist:
+            hd = s.holding_days_dist
+            lines.append(
+                f"| {s.signal} | {hd.get(5, 0)} | {hd.get(10, 0)} | {hd.get(15, 0)} | "
+                f"{hd.get(20, 0)} | {hd.get(25, 0)} | {hd.get(30, 0)} | {hd.get('+∞', 0)} |"
+            )
+        else:
+            lines.append(f"| {s.signal} | - | - | - | - | - | - | - |")
+    lines.append("")
+
+    # 盈亏分位数
+    lines.append("## 盈亏分位数")
+    lines.append("")
+    lines.append("| 信号名 | P10 | P25 | P50(中位数) | P75 | P90 |")
+    lines.append("|---|---|---|---|---|---|")
+    for s in signal_stats:
+        if s.pnl_percentiles:
+            p = s.pnl_percentiles
+            lines.append(
+                f"| {s.signal} | {p.get('p10', 0):.2f} | {p.get('p25', 0):.2f} | "
+                f"{p.get('p50', 0):.2f} | {p.get('p75', 0):.2f} | {p.get('p90', 0):.2f} |"
+            )
+        else:
+            lines.append(f"| {s.signal} | - | - | - | - | - |")
+    lines.append("")
+
     # Factor Value Stats
     lines.append("## Factor Value Stats")
     lines.append("")
-    lines.append("| factor | min | max | mean | std | p25 | p50 | p75 |")
+    lines.append("| 因子名 | 最小值 | 最大值 | 均值 | 标准差 | 25分位 | 中位数 | 75分位 |")
     lines.append("|---|---|---|---|---|---|---|---|")
     for f in factor_stats:
         lines.append(

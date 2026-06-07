@@ -3,16 +3,16 @@ my-quant3 策略生成系统 — CLI 入口
 ============================================================
 === 模式 1: 生成新策略 ===
 ============================================================
-python strategies/strategies.py generate
+python strategies.py generate
 # 行为:LLM 按业务目标(前 90% 锚点)生成新策略
 # 产出:subjects/<name>/strategiesParam/<name>_v1.md + subjects/<name>/<name>_original.md
 
 ============================================================
 === 模式 2: Part A 参数调优 ===
 ============================================================
-python strategies/strategies.py optimize <name>                     # 默认 = once(单次触发)
-python strategies/strategies.py optimize <name> once                # 显式单次触发
-python strategies/strategies.py optimize <name> watch               # 持续监听(Ctrl+C 退出)
+python strategies.py optimize <name>                     # 默认 = once(单次触发)
+python strategies.py optimize <name> once                # 显式单次触发
+python strategies.py optimize <name> watch               # 持续监听(Ctrl+C 退出)
 
 # 重启时从原始版本引导(可选)
 python strategies/strategies.py optimize <name> once --from-original
@@ -20,9 +20,9 @@ python strategies/strategies.py optimize <name> once --from-original
 ============================================================
 === 模式 3: Part B 因子权重调优 ===
 ============================================================
-python strategies/strategies.py factor_weights <name>               # 默认 = once
-python strategies/strategies.py factor_weights <name> once          # 显式单次
-python strategies/strategies.py factor_weights <name> watch         # 持续监听
+python strategies.py factor_weights <name>               # 默认 = once
+python strategies.py factor_weights <name> once          # 显式单次
+python strategies.py factor_weights <name> watch         # 持续监听
 
 ============================================================
 === 工具命令 ===

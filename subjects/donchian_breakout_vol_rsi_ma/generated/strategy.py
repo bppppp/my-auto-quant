@@ -147,6 +147,33 @@ class Strategy:
             score += ew["rsi_entry"]
         return score
 
+    def get_triggered_signals(self, factors: dict, params: dict, weights: dict) -> list[str]:
+        """返回触发入场的信号名列表（供 runner 记录事件用）。
+
+        此方法的触发条件必须与 entry_score 中的条件保持一致。
+        """
+        triggered = []
+        # breakout_entry: close > donchian_high_20 AND volume_ratio_20 > threshold
+        if (
+            factors["close"].iloc[-1] > factors["donchian_high_20"].iloc[-1]
+            and factors["volume_ratio_20"].iloc[-1] > params["vol_breakout_threshold"]
+        ):
+            triggered.append("breakout_entry")
+        # trend_entry: ma_20 > ma_60 AND close > ma_20
+        if (
+            factors["ma_20"].iloc[-1] > factors["ma_60"].iloc[-1]
+            and factors["close"].iloc[-1] > factors["ma_20"].iloc[-1]
+        ):
+            triggered.append("trend_entry")
+        # rsi_entry: rsi_14 in [rsi_entry_low, rsi_entry_high]
+        if check_rsi_in_range(
+            factors["rsi_14"].iloc[-1],
+            params["rsi_entry_low"],
+            params["rsi_entry_high"],
+        ):
+            triggered.append("rsi_entry")
+        return triggered
+
     def should_exit(self, position: dict, factors: dict, params: dict, weights: dict) -> str | None:
         ew = weights["exit"]
         # spec §4 出场优先级 (按 weight 降序):

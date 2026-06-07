@@ -129,11 +129,24 @@ class Strategy:
     #    weights 由调用方按 mode 1 / mode 2 不同来源传入
     def should_exit(self, position, factors, params, weights):
         ...
+
+    # 6. 获取触发入场的信号名列表（供 runner 记录事件用）
+    #    返回 entry_signals 中触发条件的信号名列表
+    #    注意：此方法的触发条件必须与 entry_score 中的条件保持一致
+    def get_triggered_signals(self, factors, params, weights):
+        triggered = []
+        # 根据 entry_signals 中的条件判断每个信号是否触发
+        # 示例：
+        #   if factors["ma_5"].iloc[-1] > factors["ma_20"].iloc[-1]:
+        #       triggered.append("ma_golden_cross")
+        #   if factors["atr_14"].iloc[-1] > factors["atr_14_prev"].iloc[-1]:
+        #       triggered.append("atr_expand")
+        return triggered
 ```
 
 ### 4.2 LLM 翻译 spec → strategy.py 的规则
 
-LLM 读 spec 写 strategy.py 时，按以下规则**手写** 3 个方法。
+LLM 读 spec 写 strategy.py 时，按以下规则**手写** 4 个方法（含新增的 `get_triggered_signals`）。
 
 #### 4.2.1 spec → DataFrame 列名映射
 

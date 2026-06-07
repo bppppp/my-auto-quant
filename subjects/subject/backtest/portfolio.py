@@ -26,6 +26,8 @@ class Position:
     highest: float
     holding_days: int = 0
     """入场后最高收盘价. 组合层每根 K 线更新: highest = max(previous_highest, close)."""
+    entry_signals: list[str] = field(default_factory=list)
+    """触发入场的信号名列表（如 ["trend_entry", "rsi_entry"]）。用于 exit 时关联统计。"""
 
     def to_state_dict(self) -> dict:
         """转成 strategy.should_exit(position, ...) 需要的 dict. 见 PARTS_SUMMARY.md §2.5."""
@@ -83,11 +85,15 @@ class Portfolio:
         price: float,
         shares: int,
         date: pd.Timestamp,
+        entry_signals: list[str] | None = None,
     ) -> tuple[int, float]:
         """执行买入 (假设 100 股整数倍 + T+1 检查由 caller 保证).
 
         entry_price = (amount + fee) / shares  —— **含费用调整** (见 PARTS_SUMMARY §2.5).
         加仓时, new entry_price 为**含费总成本**的加权平均.
+
+        Args:
+            entry_signals: 触发入场的信号名列表（用于 exit 时关联统计）
 
         Returns:
             (actual_shares, total_cost). total_cost = amount + fee, 从 cash 扣除.
@@ -120,6 +126,7 @@ class Portfolio:
                 code=code, shares=shares,
                 entry_price=effective_entry, entry_date=date,
                 highest=price, holding_days=0,
+                entry_signals=entry_signals or [],
             )
         self.history.append({
             "date": date, "code": code, "action": "buy",
@@ -132,15 +139,15 @@ class Portfolio:
         code: str,
         price: float,
         date: pd.Timestamp,
-    ) -> float:
+    ) -> tuple[float, Position | None]:
         """执行卖出全部持仓.
 
         Returns:
-            proceeds (卖出净额 = amount - fee, 加到 cash).
+            (proceeds, pos): 卖出净额 = amount - fee (加到 cash), 以及被卖出的 Position（包含 entry_signals 用于关联统计）。
         """
         pos = self.positions.get(code)
         if pos is None or pos.shares <= 0:
-            return 0.0
+            return 0.0, None
         shares = pos.shares
         amount = price * shares
         fee = calc_sell_fee(amount, code)
@@ -151,7 +158,7 @@ class Portfolio:
             "date": date, "code": code, "action": "sell",
             "shares": shares, "price": price, "fee": fee, "amount": amount,
         })
-        return proceeds
+        return proceeds, pos
 
     # ----- 每根 K 线更新 -----
     def update_after_bar(self, code: str, close: float) -> None:

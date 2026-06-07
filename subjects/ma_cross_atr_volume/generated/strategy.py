@@ -127,6 +127,26 @@ class Strategy:
         vol_ok = factors["volume_ratio_20"].iloc[-1] > params["volume_breakout_ratio"]
         return 1.0 if (ma_cross and (atr_ok or vol_ok)) else 0.0
 
+    def get_triggered_signals(self, factors: dict, params: dict, weights: dict) -> list[str]:
+        """返回触发入场的信号名列表（供 runner 记录事件用）。
+
+        此方法的触发条件必须与 entry_score 中的条件保持一致。
+        """
+        triggered = []
+        # ma_golden_cross: ma_5 > ma_20
+        if factors["ma_5"].iloc[-1] > factors["ma_20"].iloc[-1]:
+            triggered.append("ma_golden_cross")
+        # atr_expand: atr_14 上涨且相对价格超过阈值
+        if (
+            factors["atr_14"].iloc[-1] > factors["atr_14_prev"].iloc[-1]
+            and factors["atr_14"].iloc[-1] / factors["close"].iloc[-1] > params["atr_min_threshold"]
+        ):
+            triggered.append("atr_expand")
+        # volume_confirm: 成交量放大
+        if factors["volume_ratio_20"].iloc[-1] > params["volume_breakout_ratio"]:
+            triggered.append("volume_confirm")
+        return triggered
+
     def should_exit(self, position: dict, factors: dict, params: dict, weights: dict) -> str | None:
         ew = weights["exit"]
         for sig in sorted(ew, key=ew.get, reverse=True):

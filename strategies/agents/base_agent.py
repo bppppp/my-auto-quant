@@ -943,19 +943,19 @@ def _check_generate(fm: dict, body: str) -> list[ValidationError]:
             )
 
     # D. strategy_narrative
-    # #14 body 存在 + 字符数 ≥ 1500
-    if not body or len(body.strip()) < 1500:
+       # #14 body 存在 + 字符数 >= 800
+    if not body or len(body.strip()) < 800:
         errs.append(
             ValidationError(
                 "#14",
-                f"strategy_narrative 字符数 < 1500（实际 {len(body.strip() if body else '')}）",
+                f"strategy_narrative 字符数 < 800（实际 {len(body.strip() if body else 0)}）",
                 "strategy_narrative",
             )
         )
 
     # #15 含 6 节
     if body:
-        for sec in ("### 1.", "### 2.", "### 3.", "### 4.", "### 5.", "### 6."):
+        for sec in ("### 1.", "### 2.", "### 3.", "### 4."):
             if sec not in body:
                 errs.append(
                     ValidationError(

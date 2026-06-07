@@ -425,6 +425,10 @@ class BacktestRunner:
                         cumulative_pnl += pnl
                         trades.append({"code": code, "pnl": pnl, "holding_days": pos.holding_days, "signal": exit_sig})
                         events.append({"code": code, "signal": exit_sig, "action": "executed", "pnl": pnl, "holding_days": pos.holding_days})
+                        # 将 exit 的 pnl/holding_days 关联到触发入场的 entry 信号
+                        if pos.entry_signals:
+                            for sig_name in pos.entry_signals:
+                                events.append({"code": code, "signal": sig_name, "action": "exit_linked", "pnl": pnl, "holding_days": pos.holding_days})
                         pos = None
                     else:
                         events.append({"code": code, "signal": exit_sig, "action": "swallowed", "pnl": None, "holding_days": pos.holding_days})
@@ -441,12 +445,19 @@ class BacktestRunner:
                     if shares > 0:
                         fee = calc_buy_fee(shares * close, code)
                         effective_entry = (shares * close + fee) / shares
+                        # 调用策略的 get_triggered_signals 方法获取触发入场的信号列表
+                        triggered_signals = self.strategy.get_triggered_signals(factors, self.params, self.weights)
                         pos = Position(
                             code=code, shares=shares,
                             entry_price=effective_entry, entry_date=date,
                             highest=close, holding_days=0,
+                            entry_signals=triggered_signals,
                         )
+                        # 记录 entry_combined 事件（用于统计有信号触发的次数）
                         events.append({"code": code, "signal": "entry_combined", "action": "executed", "pnl": None, "holding_days": 0})
+                        # 同时为每个具体 entry 信号记录事件（用于 Signal Stats 报告）
+                        for sig_name in triggered_signals:
+                            events.append({"code": code, "signal": sig_name, "action": "triggered", "pnl": None, "holding_days": 0})
 
             # 4. 记录 daily value
             if pos is not None:
@@ -594,10 +605,19 @@ class BacktestRunner:
                     score = 0.0
                 scores[code] = score
                 if score > 0:
+                    # 记录 entry_combined 事件（用于统计有信号触发的股票数）
                     all_events.append({
                         "code": code, "signal": "entry_combined", "action": "triggered",
                         "score": score, "pnl": None, "holding_days": None,
                     })
+                    # 调用策略的 get_triggered_signals 方法获取触发入场的信号列表
+                    triggered_signals = self.strategy.get_triggered_signals(factors, self.params, self.weights)
+                    for sig_name in triggered_signals:
+                        sig_weight = self.weights.get("entry", {}).get(sig_name, 0.0)
+                        all_events.append({
+                            "code": code, "signal": sig_name, "action": "triggered",
+                            "score": sig_weight, "pnl": None, "holding_days": None,
+                        })
 
             prices: dict[str, float] = {code: float(r["收盘价"]) for code, r in day_data.items()}
 
@@ -626,7 +646,7 @@ class BacktestRunner:
                         # 但这里 runner 自己算的 pnl 是给 trade/event 用的, 必须独立扣一次.
                         sell_amount = close * pos.shares
                         pnl = (close - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
-                        portfolio.sell(code, close, date)
+                        _, sold_pos = portfolio.sell(code, close, date)
                         all_trades.append({
                             "code": code, "pnl": pnl,
                             "holding_days": pos.holding_days, "signal": exit_sig,
@@ -635,6 +655,13 @@ class BacktestRunner:
                             "code": code, "signal": exit_sig, "action": "executed",
                             "pnl": pnl, "holding_days": pos.holding_days,
                         })
+                        # 将 exit 的 pnl/holding_days 关联到触发入场的 entry 信号
+                        if sold_pos and sold_pos.entry_signals:
+                            for sig_name in sold_pos.entry_signals:
+                                all_events.append({
+                                    "code": code, "signal": sig_name, "action": "exit_linked",
+                                    "pnl": pnl, "holding_days": pos.holding_days,
+                                })
                     else:
                         all_events.append({
                             "code": code, "signal": exit_sig, "action": "swallowed",
@@ -692,12 +719,25 @@ class BacktestRunner:
                         amount = tv * weight
                         shares = int(amount / close / 100) * 100
                         if shares > 0:
-                            actual, cost = portfolio.buy(code, close, shares, date)
+                            # 获取触发入场的信号列表（调用策略方法）
+                            if code in factors_by_code:
+                                triggered_signals = self.strategy.get_triggered_signals(
+                                    factors_by_code[code], self.params, self.weights
+                                )
+                            else:
+                                triggered_signals = []
+                            actual, cost = portfolio.buy(code, close, shares, date, entry_signals=triggered_signals)
                             if actual > 0:
                                 all_events.append({
                                     "code": code, "signal": "entry_combined", "action": "executed",
                                     "pnl": None, "holding_days": 0,
                                 })
+                                # 为每个具体 entry 信号记录事件
+                                for sig_name in triggered_signals:
+                                    all_events.append({
+                                        "code": code, "signal": sig_name, "action": "triggered",
+                                        "pnl": None, "holding_days": 0,
+                                    })
                             else:
                                 all_events.append({
                                     "code": code, "signal": "entry", "action": "skipped",
