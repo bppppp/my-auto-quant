@@ -92,14 +92,17 @@ def resolve_name_conflict(name: str) -> str:
 
 
 def rename_strategy_dir(old_name: str, new_name: str) -> Path:
-    """重命名 subjects/<old>/ → subjects/<new>/, 同步改 spec / v1 文件名 + name 字段."""
+    """重命名 subjects/<old>/ → subjects/<new>/, 同步改 spec / v1 文件名 + name 字段.
+
+    会扫描所有子目录 (strategiesParam/, strategiesWeight/), 替换 <old_name>_* → <new_name>_*
+    """
     old_dir = subjects_dir() / old_name
     new_dir = subjects_dir() / new_name
     if not old_dir.exists():
         raise FileNotFoundError(f"{old_dir} 不存在")
     old_dir.rename(new_dir)
 
-    # 改 _original.md 内 name 字段
+    # 改 _original.md 内 name 字段 + 文件名
     for md in new_dir.glob("*_original.md"):
         content = md.read_text(encoding="utf-8")
         content = re.sub(
@@ -113,9 +116,18 @@ def rename_strategy_dir(old_name: str, new_name: str) -> Path:
         md.rename(new_md)
         new_md.write_text(content, encoding="utf-8")
 
-    # 改 v1.md 文件名
-    for v1 in new_dir.glob(f"{old_name}_v1.md"):
-        v1.rename(new_dir / v1.name.replace(old_name, new_name))
+    # 改所有子目录里的 v1.md / weight_v1.md 文件名
+    # 包括顶层, strategiesParam/, strategiesWeight/
+    for sub in ("", "strategiesParam", "strategiesWeight"):
+        base = new_dir / sub if sub else new_dir
+        if not base.exists():
+            continue
+        for pattern in (f"{old_name}_v1.md", f"{old_name}_weight_v1.md"):
+            for f in base.glob(pattern):
+                new_f = base / f.name.replace(old_name, new_name)
+                if f != new_f:
+                    f.rename(new_f)
+                    log.info(f"    重命名: {f.name} → {new_f.name}")
 
     return new_dir
 
@@ -127,7 +139,15 @@ def run_stage_a_generate(config: PipelineConfig) -> str:
 
     generate 含 quality_eval,可能耗时 30 分钟 - 1+ 小时,timeout 由 config.generate_timeout 控制.
     设置为 None 表示不设超时 (依赖外部 Ctrl+C).
+
+    注意: LLM 大输出在 Windows PIPE 上偶尔会被截断, 因此 fallback 到扫 subjects/ 最新目录.
     """
+    import time
+
+    # 记录调用前 subjects/ 内目录的 mtime, 用于 fallback
+    subjects_root = subjects_dir()
+    before = {p.name: p.stat().st_mtime for p in subjects_root.iterdir() if p.is_dir()} if subjects_root.exists() else {}
+
     cmd = [sys.executable, "strategies/strategies.py", "generate"]
     timeout_str = f"{config.generate_timeout}s" if config.generate_timeout is not None else "无限制"
     log.info(f"  $ {' '.join(cmd)}  (timeout={timeout_str})")
@@ -137,13 +157,29 @@ def run_stage_a_generate(config: PipelineConfig) -> str:
         timeout=config.generate_timeout,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"generate exit {result.returncode}\nSTDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}")
+        raise RuntimeError(
+            f"generate exit {result.returncode}\n"
+            f"STDOUT: {(result.stdout or '')[-500:]}\n"
+            f"STDERR: {(result.stderr or '')[-500:]}"
+        )
 
     # 解析 LLM 输出
-    m = re.search(r"\[generate\] 成功: subjects/([^/]+)/", result.stdout)
-    if not m:
-        raise RuntimeError(f"无法从 generate 输出解析策略名: {result.stdout[-500:]}")
-    candidate = m.group(1)
+    candidate: Optional[str] = None
+    m = re.search(r"\[generate\] 成功: subjects/([^/]+)/", result.stdout or "")
+    if m:
+        candidate = m.group(1)
+    else:
+        # Fallback: 扫 subjects/ 找 mtime 最新且晚于调用前的目录
+        log.warning("  ⚠️ stdout 解析失败, fallback 扫 subjects/ 最新目录")
+        if not subjects_root.exists():
+            raise RuntimeError(f"无法从 generate 输出解析策略名: {(result.stdout or '')[-500:]}\n且 subjects/ 不存在")
+        after = [(p, p.stat().st_mtime) for p in subjects_root.iterdir() if p.is_dir()]
+        new_dirs = [(p, t) for p, t in after if p.name not in before or t > before[p.name]]
+        if not new_dirs:
+            raise RuntimeError(f"无法从 generate 输出解析策略名: {(result.stdout or '')[-500:]}\n且未发现新策略目录")
+        new_dirs.sort(key=lambda x: x[1], reverse=True)
+        candidate = new_dirs[0][0].name
+        log.info(f"  → fallback 解析: {candidate} (mtime={time.ctime(new_dirs[0][1])})")
 
     unique = resolve_name_conflict(candidate)
     if unique != candidate:
@@ -322,25 +358,77 @@ def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> Non
     Args:
         timeout: 子进程超时秒数,None 表示不设超时 (依赖外部 Ctrl+C).
     """
-    cmd = [sys.executable, "strategies/strategies.py", subcommand] + args
+    import time as _time
+    cmd = [sys.executable, "-u", "strategies/strategies.py", subcommand] + args
     timeout_str = f"{timeout}s" if timeout is not None else "无限制"
     log.info(f"    $ {' '.join(cmd)}  (timeout={timeout_str})")
-    result = subprocess.run(cmd, cwd=project_root(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-    if result.returncode != 0:
+
+    proc = subprocess.Popen(
+        cmd, cwd=project_root(),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        shell=False, bufsize=1,
+    )
+    last_report = _time.time()
+    deadline = _time.time() + timeout if timeout else float("inf")
+    chunks: list[str] = []
+
+    while True:
+        if _time.time() > deadline:
+            log.error(f"    ❌ {subcommand} 超时 ({timeout}s), 强杀")
+            proc.kill()
+            raise RuntimeError(f"{subcommand} 超时 {timeout}s")
+        line = proc.stdout.readline() if proc.stdout else ""
+        if line:
+            chunks.append(line)
+            stripped = line.strip()
+            # 关键行实时打印
+            if any(kw in stripped.lower() for kw in ("loading", "optimize", "factor", "weight", "tune", "generate", "完成", "成功", "失败", "参数", "周期", "策略")):
+                log.info(f"    | {stripped[:200]}")
+        if _time.time() - last_report > 60:
+            log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}")
+            last_report = _time.time()
+        if proc.poll() is not None:
+            if proc.stdout:
+                rest = proc.stdout.read()
+                if rest:
+                    chunks.append(rest)
+            break
+        _time.sleep(0.5)
+
+    full = "".join(chunks)
+    my_pid = proc.pid  # 记录 PID 防止误杀
+    # 显式 wait 回收 zombie
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            log.info(f"    → 清理 {subcommand} 进程 pid={my_pid}")
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        log.error(f"    ❌ {subcommand} exit {proc.returncode}, 最后 20 行:")
+        for ln in full.splitlines()[-20:]:
+            log.error(f"        {ln}")
         raise RuntimeError(
-            f"{subcommand} exit {result.returncode}\n"
-            f"STDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}"
+            f"{subcommand} exit {proc.returncode}\n"
+            f"STDOUT (tail 500):\n{full[-500:]}"
         )
+    log.info(f"    ✅ {subcommand} 完成, 总输出 {len(full)} 字符")
 
 
 def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
-    """调 subject.cli run 跑 backtest.
+    """调 subject.cli run 跑 backtest, 实时输出 stdout 到 log (避免长时间 subprocess 看不到 progress).
 
     Args:
         timeout: 子进程超时秒数,None 表示不设超时.
     """
+    import time as _time
     cmd = [
-        sys.executable, "-m", "subject.cli", "run",
+        sys.executable, "-u",  # unbuffered, 强制 print 行级 flush 到 pipe
+        "-m", "subject.cli", "run",
         "--strategy", name,
         "--mode", mode,
     ]
@@ -348,14 +436,72 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
         cmd += ["--weight-test", name]
     timeout_str = f"{timeout}s" if timeout is not None else "无限制"
     log.info(f"    $ {' '.join(cmd)} (cwd=subjects/, timeout={timeout_str})")
-    result = subprocess.run(
-        cmd, cwd=subjects_dir(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
+
+    # 用 Popen 实时读 stdout, 避免 capture_output=True 在长跑时把输出压到 return 时才释放
+    proc = subprocess.Popen(
+        cmd, cwd=subjects_dir(),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # 合并 stderr 到 stdout
+        text=True, encoding="utf-8", errors="replace",
+        shell=False, bufsize=1,  # 行缓冲
     )
-    if result.returncode != 0:
+    log.info(f"    → backtest 进程 pid={proc.pid}")
+
+    last_progress_report = _time.time()
+    deadline = _time.time() + timeout if timeout else float("inf")
+    stdout_chunks: list[str] = []
+
+    while True:
+        if _time.time() > deadline:
+            log.error(f"    ❌ backtest 超时 ({timeout}s), 强杀")
+            proc.kill()
+            raise RuntimeError(f"backtest {mode} 超时 {timeout}s")
+
+        line = proc.stdout.readline() if proc.stdout else ""
+        if line:
+            stdout_chunks.append(line)
+            # 关键行: 含 "loading", "backtest", "factor", "weight", "done", "%" 等
+            stripped = line.strip()
+            if any(kw in stripped.lower() for kw in ("loading", "backtest", "factor", "weight", "computing", "running", "完成", "report", "策略", "周期", "交易", "回测", "因子", "stock", "done", "%")):
+                log.info(f"    | {stripped[:200]}")
+
+        # 60 秒无新输出就报告 (即使没关键行, 也告诉用户"还在跑")
+        if _time.time() - last_progress_report > 60:
+            log.info(f"    ⏳ backtest 仍在跑, pid={proc.pid}, 已 {_time.time() - (deadline - timeout):.0f}s")
+            last_progress_report = _time.time()
+
+        if proc.poll() is not None:
+            # 进程退出, 读完剩余
+            if proc.stdout:
+                rest = proc.stdout.read()
+                if rest:
+                    stdout_chunks.append(rest)
+            break
+
+        _time.sleep(0.5)
+
+    full_output = "".join(stdout_chunks)
+    my_pid = proc.pid  # 记录 PID 防止误杀 (Popen 持有, 不影响外部进程)
+    # 显式 wait 回收 zombie 进程 (防止进程残留)
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            log.info(f"    → 清理 backtest 进程 pid={my_pid}")
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        # 打印最后 30 行帮诊断
+        last_lines = full_output.splitlines()[-30:]
+        log.error(f"    ❌ backtest {mode} exit {proc.returncode}, 最后 30 行输出:")
+        for ln in last_lines:
+            log.error(f"        {ln}")
         raise RuntimeError(
-            f"backtest {mode} exit {result.returncode}\n"
-            f"STDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}"
+            f"backtest {mode} exit {proc.returncode}\n"
+            f"STDOUT (tail 500):\n{full_output[-500:]}"
         )
+    log.info(f"    ✅ backtest 完成, exit=0, 总输出 {len(full_output)} 字符")
 
 
 def parse_latest(name: str, mode: str) -> dict:
@@ -420,11 +566,13 @@ def main_loop(args, config: PipelineConfig) -> int:
             log.error(f"Stage B (translate) 失败: {e}")
             consecutive_translate_failures += 1
             state.mark_failed(strategy_name, reason=str(e))
+            state.save()  # 落盘: 标记 failed 状态,避免下次 has_pending() 误判
             if consecutive_translate_failures >= config.consecutive_failures_threshold:
                 return maybe_exit_on_failures(args, consecutive_translate_failures)
         except Exception as e:
             log.exception(f"Stage 失败: {e}")
             state.mark_failed(strategy_name, reason=f"{type(e).__name__}: {e}")
+            state.save()  # 落盘: 同上
             if not args.auto:
                 return 1
 

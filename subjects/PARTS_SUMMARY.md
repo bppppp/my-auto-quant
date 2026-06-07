@@ -24,12 +24,14 @@ LLM 翻译 spec 到 `generated/strategy.py` 时，按以下 3 个**检索对象*
 ## 1. Factors（公共因子）
 
 ### `ma`
-- **Signature**：`ma(close: pd.Series, period: int) -> pd.Series`
-- **Description**：简单移动平均线（SMA）。计算 `close` 在 `period` 个交易日内的算术平均值。
-- **Returns**：Series，长度与 `close` 一致；前 `period-1` 行为 NaN。
-- **Use cases**：趋势判断（ma 上升=上升趋势）、均线交叉（金叉/死叉）、动态支撑阻力位。
-- **适用场景**：所有需要"价格平滑"的策略（趋势跟踪、均值回归、动量等）。
-- **Example**：`ma_20 = ma(df["close"], 20)` — 计算 20 日简单移动平均。
+- **Signature**：`ma(series: pd.Series, period: int) -> pd.Series`
+- **Description**：简单移动平均线（SMA）。计算 `series` 在 `period` 个交易日内的算术平均值。**series 不限于 close** —— 任何 pd.Series 都可以（如成交量 `df["成交量（股）"]`、换手率等），用法相同。
+- **Returns**：Series，长度与 `series` 一致；前 `period-1` 行为 NaN。
+- **Use cases**：趋势判断（ma 上升=上升趋势）、均线交叉（金叉/死叉）、动态支撑阻力位、量能均线（量比基准）。
+- **适用场景**：所有需要"序列平滑"的策略（趋势跟踪、均值回归、动量、量价配合等）。
+- **Example**：
+  - 价格均线：`ma_20 = ma(df["close"], 20)` — 计算 20 日简单移动平均
+  - 量能均线：`vol_ma_20 = ma(df["成交量（股）"], 20)` — 计算 20 日均量（量能确认 / 量比基准）
 - **Common params**：`period` 常用 5 / 10 / 20 / 60 / 120 / 250。
 - **Edge cases**：上市未满 `period` 日的股票，前 `period-1` 行返回 NaN（由调用方决定是否过滤）。
 - **Introduced by**：ma_cross_atr_volume, donchian_breakout_vol_rsi_ma

@@ -85,7 +85,15 @@ if str(_SUBJECTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SUBJECTS_DIR))
 
 from subject.factors import (  # noqa: E402 — 只 import 实际用到的
-    # 例: ma, atr, rsi, donchian_high, donchian_low, volume_ratio, mom
+    # 可用白名单(不要 import 其他, LLM 易幻觉 adx/macd/kdj 等不存在的函数):
+    #   ma(series, n)                          # 简单移动平均
+    #   atr(df, n)                             # ATR (df 含 high/low/close)
+    #   rsi(series, n)                         # RSI
+    #   donchian(series, n)                    # 唐奇安中轨
+    #   donchian_high(series, n)               # 唐奇安上轨
+    #   donchian_low(series, n)                # 唐奇安下轨
+    #   mom(series, n)                         # 动量
+    #   volume_ratio(volume, n)                # 量比
 )
 from subject.conditions import (  # noqa: E402 — 只 import 实际用到的
     # 例: check_fixed_stop, check_trailing_stop, check_atr_stop, check_time_stop,
@@ -283,6 +291,10 @@ if __name__ == "__main__":
 8. **entry_score 永远 `score += weights["entry"][<signal_name>]`**, 禁止 `score += 0.5`
 9. **should_exit 必须 `sorted(weights["exit"], key=weights["exit"].get, reverse=True)` 遍历**
 10. **公共函数**从 `subject.factors` / `subject.conditions` import, 不要自己实现 ma / atr / rsi / fixed_stop 等
+   - **`subject.factors` 实际只有 8 个函数** (硬白名单, **严禁 import 其他**):
+     `ma`, `atr`, `rsi`, `donchian`, `donchian_high`, `donchian_low`, `mom`, `volume_ratio`
+   - **绝对不要 import** `adx` / `macd` / `kdj` / `boll` / `cci` / `obv` / `vwap` / `trix` 等 — 运行时 `ImportError` 会让翻译失败
+   - 如果 spec 提到这些指标, 用现有函数近似实现 (例: adx → atr + mom; macd → ma 差值)
 11. **<factor>_prev** = `factors[<factor>].shift(1)`
 12. **AND 逻辑用 `&`**, 不是 Python 的 `and`
 13. **不允许写硬编码 weight 数值** (e.g. `score += 0.5` 是错的)

@@ -67,7 +67,7 @@ _EVAL_DIMS = (
 )
 _MAX_SCORE_PER_DIM = 10
 _TOTAL_MAX = len(_EVAL_DIMS) * _MAX_SCORE_PER_DIM  # 60
-_PASS_THRESHOLD = 0.90  # 90%
+_PASS_THRESHOLD = 0.90  # 90% (用户决策)
 
 
 def _judge_hard_gates(eval_result: dict) -> dict:

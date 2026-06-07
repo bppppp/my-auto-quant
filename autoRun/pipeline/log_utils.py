@@ -52,6 +52,22 @@ def get_logger(name: str = "pipeline") -> logging.Logger:
     file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     logger.addHandler(file_handler)
 
+    # 实时 flush: FileHandler 换成行缓冲 subclass, 避免长 subprocess 期间看不到日志
+    class _LineBufferedFileHandler(logging.FileHandler):
+        def emit(self, record):
+            super().emit(record)
+            try:
+                self.flush()
+            except Exception:
+                pass
+
+    # 把刚才加的 file_handler 替换为行缓冲版本
+    logger.removeHandler(file_handler)
+    file_handler.close()
+    file_handler = _LineBufferedFileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+    logger.addHandler(file_handler)
+
     _INITIALIZED = True
     logger.info(f"━━━ pipeline 启动 (log: {log_file}) ━━━")
     return logger

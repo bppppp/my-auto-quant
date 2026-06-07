@@ -83,14 +83,23 @@ if str(_PROJECT_ROOT) not in sys.path:
 # ====================================================================
 # 子命令 handler
 # ====================================================================
-def cmd_generate(_args: argparse.Namespace) -> int:
-    """模式 1:生成新策略"""
-    from strategies.agents.generate import run_generate
+def cmd_generate(args: argparse.Namespace) -> int:
+    """模式 1:生成新策略
+
+    默认: 内部 while True 死循环, 直到 quality_eval 通过才退出。
+    --once: 只跑单轮 (_run_generate_once), 失败/未达标立即退出非 0,
+            适合 autoRun pipeline 调 (一次只产 1 个策略, 失败由 pipeline 兜底)。
+    """
+    from strategies.agents.generate import run_generate, _run_generate_once
     from strategies.config import RuntimeSettings
 
     rt = RuntimeSettings.from_env()
     try:
-        path = run_generate(max_retries=rt.self_eval_max_retries)
+        if getattr(args, "once", False):
+            # 单轮: 一轮内的 max_retries 重试后未通过 quality_eval 就抛 RuntimeError
+            path = _run_generate_once(max_retries=rt.self_eval_max_retries, round_no=1)
+        else:
+            path = run_generate(max_retries=rt.self_eval_max_retries)
     except Exception as e:
         print(f"[generate] 失败: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
@@ -270,6 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # generate(无子命令组,单次触发)
     p_gen = sub.add_parser("generate", help="模式 1:生成新策略(LLM 按业务目标生成)")
+    p_gen.add_argument("--once", action="store_true",
+                       help="只跑单轮 (失败立即退), 默认死循环直到 quality_eval 通过")
     p_gen.set_defaults(_handler=cmd_generate)
 
     # optimize / factor_weights(once | watch 互斥)

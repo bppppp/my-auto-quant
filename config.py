@@ -49,6 +49,10 @@ LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.minimaxi.com/v1")
 LLM_MODEL: str = os.getenv("LLM_MODEL", "MiniMax-M3")
 LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
 
+# ===== Claude Code CLI 路径 (autoRun/pipeline/translator.py 调) =====
+# 每台电脑安装位置可能不同(Windows npm 全局: D:/nodejs/...; macOS: /usr/local/bin/...)
+CLAUDE_CLI_PATH: str = os.getenv("CLAUDE_CLI_PATH", "claude")
+
 # ===== 推理参数 =====
 DEFAULT_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 GENERATE_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE_GENERATE", "0.3"))
