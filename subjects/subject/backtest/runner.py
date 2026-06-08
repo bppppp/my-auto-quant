@@ -30,6 +30,12 @@ from .data_loader import load_day, load_stock
 from .fees import calc_buy_fee, calc_sell_fee
 from .log_utils import setup_backtest_logger
 from .metrics import compute_metrics
+from subject.factors._cache import (  # 预计算因子 cache
+    bind_current_code, bind_factor_cache, reset_current_code,
+)
+from subject.backtest.data_loader.by_stock_factor import (  # 预计算因子 loader
+    try_load_stock_factor,
+)
 from ..parser import parse_strategy_spec
 from .portfolio import (
     Portfolio,
@@ -310,7 +316,15 @@ class BacktestRunner:
                 continue
 
             try:
-                res = self._backtest_single_stock(df, code)
+                # === 预计算公共因子 bind (包住整只股的回测) ===
+                code6 = code.split(".")[0]
+                factor_df = try_load_stock_factor(code6)
+                bind_factor_cache(code6, factor_df)
+                token = bind_current_code(code6)
+                try:
+                    res = self._backtest_single_stock(df, code)
+                finally:
+                    reset_current_code(token)
             except Exception as e:
                 self.logger.error(f"[{i}/{total_stocks}] {code} - backtest failed: {e}", exc_info=True)
                 continue
@@ -528,6 +542,16 @@ class BacktestRunner:
             f"(skipped: {skipped_history})"
         )
 
+        # === 预计算公共因子 preload (与 stock_history 并行加载, 缺则不存) ===
+        stock_factor_history: dict[str, pd.DataFrame] = {}
+        for code in stock_history:
+            factor_df = try_load_stock_factor(code.split(".")[0])
+            if factor_df is not None:
+                stock_factor_history[code.split(".")[0]] = factor_df
+        self.logger.info(
+            f"preloaded factors for {len(stock_factor_history)}/{len(stock_history)} stocks"
+        )
+
         freq = int(self.params.get("rebalance_freq_days", 5))
         target_n = int(self.params.get("target_holdings", 8))
         max_single = float(self.params.get("max_single_weight", 0.10))
@@ -587,14 +611,21 @@ class BacktestRunner:
                 if not mask.any():
                     continue
                 idx = hist.index[mask][-1]  # 最后一个 <= today 的位置
+                # === 预计算公共因子 bind ===
+                code6 = code.split(".")[0]
+                factor_df = stock_factor_history.get(code6)
+                bind_factor_cache(code6, factor_df)
+                token = bind_current_code(code6)
                 try:
                     factors = self.strategy.compute_factors(hist.iloc[: idx + 1], self.params)
                 except Exception as e:
+                    reset_current_code(token)
                     all_events.append({
                         "code": code, "signal": "compute", "action": "skipped",
                         "error": str(e), "pnl": None, "holding_days": None,
                     })
                     continue
+                reset_current_code(token)
                 factors_by_code[code] = factors
                 for k, v in factors.items():
                     if isinstance(v, pd.Series) and len(v) > 0 and not pd.isna(v.iloc[-1]):

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ._cache import try_get_cached_factor
+
 
 def ma(series: pd.Series, period: int) -> pd.Series:
     """计算 period 日简单移动平均线 (SMA).
@@ -26,4 +28,8 @@ def ma(series: pd.Series, period: int) -> pd.Series:
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
+    # 预计算 cache 命中: 直接返回预计算的 Series (length 自动对齐)
+    cached = try_get_cached_factor(f"ma_{period}", length=len(series))
+    if cached is not None:
+        return cached
     return series.rolling(window=period, min_periods=period).mean()

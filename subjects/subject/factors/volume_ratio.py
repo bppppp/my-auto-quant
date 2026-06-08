@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ._cache import try_get_cached_factor
+
 
 def volume_ratio(volume: pd.Series, period: int = 20) -> pd.Series:
     """计算 period 日量比.
@@ -22,5 +24,10 @@ def volume_ratio(volume: pd.Series, period: int = 20) -> pd.Series:
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
+    # 预计算 cache 命中: 直接返回预计算的 Series
+    # 注: pre-compute 仅有 volume_ratio_20. 其他 period 调用走运行时.
+    cached = try_get_cached_factor("volume_ratio_20", length=len(volume))
+    if cached is not None:
+        return cached
     avg = volume.rolling(window=period, min_periods=period).mean()
     return volume / avg

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ._cache import try_get_cached_factor
+
 
 def atr(
     high: pd.Series,
@@ -34,6 +36,11 @@ def atr(
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
+    # 预计算 cache 命中: 直接返回预计算的 Series
+    # 注: pre-compute 仅有 atr_14. 其他 period 调用走运行时.
+    cached = try_get_cached_factor("atr_14", length=len(close))
+    if cached is not None:
+        return cached
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()

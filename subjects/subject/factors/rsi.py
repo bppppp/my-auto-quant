@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ._cache import try_get_cached_factor
+
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """计算 period 日 RSI.
@@ -24,6 +26,11 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
+    # 预计算 cache 命中: 直接返回预计算的 Series
+    # 注: pre-compute 仅有 rsi_14. 其他 period 调用走运行时.
+    cached = try_get_cached_factor("rsi_14", length=len(close))
+    if cached is not None:
+        return cached
     diff = close.diff()
     gain = diff.clip(lower=0.0)
     loss = (-diff).clip(lower=0.0)
