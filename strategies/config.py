@@ -142,7 +142,7 @@ def get_llm_settings(
 class RuntimeSettings:
     """策略生成/调优系统的运行时可调参数。"""
 
-    self_eval_max_retries: int = 20  # 模式 1(generate)—— 直到通过 90% 阈值
+    self_eval_max_retries: int = 20  # 模式 1(generate)—— 直到通过 85% 阈值
     debounce_seconds: float = 5.0
     watch_create_only: bool = True
     max_listen_iterations: int = 20

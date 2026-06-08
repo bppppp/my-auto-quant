@@ -99,8 +99,8 @@ def _build_user_prompt() -> str:
 1. 输出 JSON（用 ```json 代码块），结构与 system prompt 严格一致
 2. `name`: snake_case，≤ 64 字符，无 _v<N> 后缀
 3. `test_universe`: list，从 3 个 universe 中选 1~3 个（HS300 / CSI1000 / CYB_STAR_50）
-4. `frontmatter`: 7 区块（targets / factors / entry_signals / exit_signals / position_weights / params）+ 元信息
-5. `strategy_narrative`: 单字段，≥ 1500 字符，含 6 节
+4. `frontmatter`: 6 区块（targets / factors / entry_signals / exit_signals / position_weights / params）+ 元信息
+5. `strategy_narrative`: 单字段，≥ 1200 字符，含 5 节
 6. `params[].description`: ≥ 30 字符，含含义/单位/典型取值/默认值理由 4 要素
 7. 所有数字阈值 param 化（trigger 中除 0/1/100/1000 外不能有硬编码数字）
 8. factors 不带 weight / direction，仅作"计算词汇表"
@@ -131,61 +131,135 @@ def _format_validation_errors(errors: list) -> str:
     return "\n".join(lines)
 
 
-def _format_quality_eval_feedback(eval_result: dict) -> str:
-    """把 quality_eval 失败转成 user_prompt 末尾的反馈(用户决策:85% 阈值)。
+# 6 维修复模板 — 当 LLM 在某维低分时,告诉它下次具体怎么改
+_DIMENSION_FIX_TEMPLATES = {
+    "business_goal_alignment": (
+        "重新审视 targets.annual_return 与策略类型的关系: "
+        "趋势跟随策略年化 > 25% 较激进,均值回归策略 < 15% 较合理"
+    ),
+    "target_consistency": (
+        "重算 win_rate × profit_loss_ratio: 若 < 1.5,提高盈亏比或胜率; "
+        "高夏普必须配高收益;高胜率可降盈亏比"
+    ),
+    "bull_bear_adaptability": (
+        "narrative 第 2 节须**明文**写 3 环境差异化处理(牛/熊/震荡),"
+        "每环境 2-3 行,所有阈值用 `{param_name}`,**不**做实时市场识别"
+    ),
+    "parameter_tunability": (
+        "B2 8 项检查: 入场/出场/调仓/加仓/减仓/风控/仓位调整/position_weights 字段; "
+        "description 4 要素: 含义+单位+典型取值+默认值理由"
+    ),
+    "logical_self_consistency": (
+        "narrative 第 3 节须明确**出场优先级**(固定止损>移动止损>时间止损), "
+        "每个 signal weight 给业务理由"
+    ),
+    "data_implementability": (
+        "factors[].calculation 必须用标准公式(`mean(x, N)`/`atr(h,l,c, N)`/"
+        "`100 - 100/(1+...)`),禁止 `market_sentiment` / `news_score` 等不可计算变量"
+    ),
+}
 
-    通过条件:6 维总分 >= 51/60(85%)。不通过则展示每维分数 + 缺失 gap,引导 LLM 改进。
-    """
-    lines = ["## 上次 quality_eval 未通过(请修正后重生成)\n"]
 
-    # 1) 6 维分数表(让 LLM 看到具体差距)
-    soft = eval_result.get("soft_evaluation", {})
-    lines.append("### 6 维评分")
-    lines.append("| 维度 | 分数 | 满分 | 差距 |")
-    lines.append("|---|---|---|---|")
-    for dim, content in soft.items():
+def _pick_weakest_dimension(soft_eval: dict) -> str:
+    """从 soft_eval 里挑 gap 最大的维度(分数最低的)。"""
+    worst_dim = None
+    worst_gap = -1.0
+    for dim, content in soft_eval.items():
         if not isinstance(content, dict):
             continue
-        s = content.get("score", 0)
         try:
-            s = float(s)
+            score = float(content.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0.0
+        gap = 10.0 - score
+        if gap > worst_gap:
+            worst_gap = gap
+            worst_dim = dim
+    return worst_dim or "data_implementability"
+
+
+def _format_quality_eval_feedback(eval_result: dict, *, attempt: int = 1) -> str:
+    """把 quality_eval 失败转成 user_prompt 末尾的反馈。
+
+    通过条件: 6 维总分 >= 51/60(85%, 见 quality_eval._PASS_THRESHOLD)。
+    不通过则展示按 gap 降序的每维分数 + 弱维度 issues + 修复模板,引导 LLM 改进。
+
+    Args:
+        eval_result: quality_eval 返回的 dict
+        attempt: 当前是第几次尝试(>= 3 时插入"换思路"警告)
+    """
+    lines: list[str] = ["## 上次 quality_eval 未通过(请修正后重生成)\n"]
+
+    # 0) 失败 ≥ 3 次时,在头部加"换思路"警告
+    if attempt >= 3:
+        lines.append(f"### ⚠️ 已失败 {attempt} 次\n")
+        lines.append("请**大幅修改策略类型/因子选择/出入场逻辑**,不要在原 spec 上做小调整。\n")
+
+    # 1) 6 维分数表(按 gap 降序排,LLM 一眼看到最弱维度)
+    soft = eval_result.get("soft_evaluation", {})
+    sorted_dims = sorted(
+        soft.items(),
+        key=lambda kv: -(10 - float(kv[1].get("score", 0))) if isinstance(kv[1], dict) else 0,
+    )
+    lines.append("### 6 维评分(按 gap 降序)\n")
+    lines.append("| 维度 | 分数 | 满分 | 差距 |")
+    lines.append("|---|---|---|---|")
+    for dim, content in sorted_dims:
+        if not isinstance(content, dict):
+            continue
+        try:
+            s = float(content.get("score", 0))
         except (TypeError, ValueError):
             s = 0
         gap = max(0.0, 10 - s)
-        lines.append(f"| {dim} | {s} | 10 | {gap:.1f} |")
+        # issues 嵌入到对应维度行
+        issues = content.get("issues", [])
+        if issues:
+            issue_strs = [
+                f"[{issue.get('severity', 'info')}] {issue.get('description', '')}"
+                for issue in issues
+            ]
+            cell = f"{dim} (有 {len(issues)} 个 issue)"
+        else:
+            cell = dim
+        lines.append(f"| {cell} | {s} | 10 | {gap:.1f} |")
+
     total = eval_result.get("_quality_total", 0)
     total_max = eval_result.get("_quality_total_max", 60)
     ratio = eval_result.get("_quality_ratio", 0)
     lines.append(
         f"| **总分** | **{total:.1f}** | **{total_max}** | "
-        f"**{ratio*100:.1f}% < 90% 阈值** |"
+        f"**{ratio*100:.1f}% < 85% 阈值** |"
     )
     lines.append("")
 
-    # 2) issues(error / warning)
-    issues_by_sev: dict[str, list[str]] = {"error": [], "warning": [], "info": []}
-    for dim, content in soft.items():
+    # 2) issues(按维度归类,而不是按 severity)
+    for dim, content in sorted_dims:
         if not isinstance(content, dict):
             continue
-        for issue in content.get("issues", []):
-            issues_by_sev.setdefault(issue.get("severity", "info"), []).append(
-                f"[{dim}] {issue.get('description', '')}"
-            )
-    for sev, label in (
-        ("error", "### error(必须修复)"),
-        ("warning", "### warning(建议修复)"),
-    ):
-        if issues_by_sev.get(sev):
-            lines.append(label)
-            for s in issues_by_sev[sev]:
-                lines.append(f"- {s}")
-            lines.append("")
+        issues = content.get("issues", [])
+        if not issues:
+            continue
+        lines.append(f"### {dim} 的 issues")
+        for issue in issues:
+            sev = issue.get("severity", "info")
+            desc = issue.get("description", "")
+            lines.append(f"- [{sev}] {desc}")
+        lines.append("")
 
-    # 3) 引导 LLM 把分数拉上去
+    # 3) 修复模板(按当前最弱维度)
+    weakest = _pick_weakest_dimension(soft)
+    template = _DIMENSION_FIX_TEMPLATES.get(weakest, "")
+    if template:
+        lines.append(f"### 修复模板(按当前最弱维度:`{weakest}`)\n")
+        lines.append(template)
+        lines.append("")
+
+    # 4) 引导 LLM 改进 + summary
     lines.append("### 提升方向")
     lines.append("- 重点关注分数最低的维度(差距最大)")
     lines.append("- error 级 issue 必须修复,否则该维度分数无法提升")
-    lines.append("- 修复后总分需达到 51/60(85%)才算通过")
+    lines.append(f"- 修复后总分需达到 {int(total_max * 0.85)}/{total_max}(85%,见 quality_eval._PASS_THRESHOLD)才算通过")
     lines.append("")
     lines.append(f"### summary\n{eval_result.get('summary', '')}")
     lines.append("\n请按上述反馈重新输出完整 JSON。")
@@ -200,14 +274,14 @@ def run_generate(*, max_retries: int = 5) -> Path:
       - 内层 N 次重试(_run_generate_once 内):一次完整流程内的 LLM/parse/校验/eval 重试
         (含硬校验失败 + quality_eval 失败,都加反馈让 LLM 改进)
 
-    通过条件(quality_eval):6 维总分 >= 54/60(90%,见 quality_eval._PASS_THRESHOLD)。
+    通过条件(quality_eval):6 维总分 >= 51/60(85%,见 quality_eval._PASS_THRESHOLD)。
 
     Returns:
         写入的 <name>_v1.md 路径
     """
     rt = RuntimeSettings.from_env()
     banner("模式 1: generate 启动")
-    log_print(f"[generate] 目标: 生成新策略,直到通过 quality_eval 90% 阈值(54/60)")
+    log_print(f"[generate] 目标: 生成新策略,直到通过 quality_eval 85% 阈值(51/60)")
     log_print(f"[generate] 每轮内 LLM 重试上限: {max_retries} (env: SELF_EVAL_MAX_RETRIES)")
     log_print(f"[generate] LLM: model=见配置, temperature=0.3, think=True")
     log_print(f"[generate] 日志文件: strategies/log/run.log(同时落盘)")
@@ -338,9 +412,9 @@ def _run_generate_once(*, max_retries: int, round_no: int) -> Path:
                 f"[generate] ✗ quality_eval 未通过: "
                 f"{eval_result.get('_quality_total', 0):.1f}/"
                 f"{eval_result.get('_quality_total_max', 60)} = "
-                f"{eval_result.get('_quality_ratio', 0)*100:.1f}% < 90% 阈值"
+                f"{eval_result.get('_quality_ratio', 0)*100:.1f}% < 85% 阈值"
             )
-            feedback_md = _format_quality_eval_feedback(eval_result)
+            feedback_md = _format_quality_eval_feedback(eval_result, attempt=attempt)
             last_error = ValueError(
                 f"quality_eval 未通过: {eval_result.get('summary', 'unknown')}"
             )
@@ -349,7 +423,7 @@ def _run_generate_once(*, max_retries: int, round_no: int) -> Path:
             f"[generate] ✓ quality_eval 通过: "
             f"{eval_result.get('_quality_total', 0):.1f}/"
             f"{eval_result.get('_quality_total_max', 60)} = "
-            f"{eval_result.get('_quality_ratio', 0)*100:.1f}% ≥ 90% 阈值"
+            f"{eval_result.get('_quality_ratio', 0)*100:.1f}% ≥ 85% 阈值"
         )
 
         # 写盘
