@@ -49,7 +49,7 @@ entry_signals:
   trigger: ma_20 > ma_60 AND close > ma_20
   logic: AND
 - name: rsi_entry
-  weight: 0.2
+  weight: 0.4
   factors:
   - rsi_14
   direction: positive
@@ -57,40 +57,40 @@ entry_signals:
   logic: AND
 exit_signals:
 - name: fixed_stop_loss
-  weight: 0.3
+  weight: 0.0
   factors: []
   direction: negative
   trigger: current_price < entry_price * (1 - {fixed_stop_loss_pct})
   logic: 单因子
 - name: trailing_stop
-  weight: 0.2
+  weight: 0.0
   factors: []
   direction: negative
   trigger: current_price < highest_close_since_entry * (1 - {trail_stop_pct})
   logic: 单因子
 - name: volatility_stop
-  weight: 0.2
+  weight: 0.0
   factors:
   - atr_14
   direction: negative
   trigger: current_price < highest_close_since_entry - {atr_stop_multiplier} * atr_14
   logic: 单因子
 - name: trend_reversal_exit
-  weight: 0.15
+  weight: 0.0
   factors:
   - donchian_low_20
   direction: negative
   trigger: close < donchian_low_20
   logic: 单因子
 - name: overbought_reduce
-  weight: 0.1
+  weight: 0.9
   factors:
   - rsi_14
   direction: negative
   trigger: rsi_14 > {rsi_overbought} AND pnl_pct > {partial_profit_pct}
   logic: AND
 - name: time_stop
-  weight: 0.05
+  weight: 0.5
   factors: []
   direction: negative
   trigger: holding_days >= {max_holding_days}

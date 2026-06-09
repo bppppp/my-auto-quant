@@ -33,7 +33,7 @@ factors:
   calculation: 100 - 100 / (1 + mean(gain, 14) / mean(loss, 14))
 entry_signals:
 - name: breakout_entry
-  weight: 0.5
+  weight: 0.6
   factors:
   - donchian_high_20
   - volume_ratio_20
@@ -41,7 +41,7 @@ entry_signals:
   trigger: close > donchian_high_20 AND volume_ratio_20 > {vol_breakout_threshold}
   logic: AND
 - name: trend_entry
-  weight: 0.3
+  weight: 0.2
   factors:
   - ma_20
   - ma_60
@@ -57,7 +57,7 @@ entry_signals:
   logic: AND
 exit_signals:
 - name: fixed_stop_loss
-  weight: 0.3
+  weight: 0.1
   factors: []
   direction: negative
   trigger: current_price < entry_price * (1 - {fixed_stop_loss_pct})
@@ -83,14 +83,14 @@ exit_signals:
   trigger: close < donchian_low_20
   logic: 单因子
 - name: overbought_reduce
-  weight: 0.1
+  weight: 0.3
   factors:
   - rsi_14
   direction: negative
   trigger: rsi_14 > {rsi_overbought} AND pnl_pct > {partial_profit_pct}
   logic: AND
 - name: time_stop
-  weight: 0.05
+  weight: 0.25
   factors: []
   direction: negative
   trigger: holding_days >= {max_holding_days}

@@ -163,6 +163,22 @@ class BacktestRunner:
         return parse_strategy_spec(path)
 
     def _load_params(self) -> dict:
+        """加载参数。
+
+        - params 模式：从 strategiesParam 读取最新 params
+        - weight 模式：从 strategiesWeight 读取最新 params（weight 文件中的 params 由 factor_weights 调优）
+        """
+        if self.mode == "weight":
+            version_file = self._pick_latest_version(
+                "strategiesWeight", prefix=f"{self.weight_test}_weight_v"
+            )
+            if version_file is not None:
+                spec = parse_strategy_spec(version_file)
+                return {p["name"]: p["default"] for p in spec["params"]}
+            # weight 文件不存在时 fallback 到 original 的 params
+            return {p["name"]: p["default"] for p in self.spec["params"]}
+
+        # params 模式
         version_file = self._pick_latest_version("strategiesParam", prefix=f"{self.strategy_name}_v")
         if version_file is None:
             return {p["name"]: p["default"] for p in self.spec["params"]}

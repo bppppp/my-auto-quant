@@ -105,11 +105,11 @@ params:
 - name: rsi_entry_low
   default: 50
   range:
-  - 25
-  - 60
+  - 30
+  - 70
   type: int
   description: RSI入场下限，避免在极度超卖时入场。单位：数值。典型取值30-50，默认40确保短期动量已从低位回升，减少接飞刀风险。
-  reason: v7 RSI入场胜率40.3%均值101，维持50保持信号质量。
+  reason: 下调至50放宽入场，v9过滤过严致收益降，RSI中位50附近合理
 - name: rebalance_freq_days
   default: 5
   range:
@@ -117,15 +117,15 @@ params:
   - 10
   type: int
   description: 再平衡频率，每隔该交易日数检查信号并调仓。单位：交易日。典型取值3-7，默认5天在及时跟进信号与减少操作噪音间取得平衡。
-  reason: 维持5日调仓，平衡信号响应与成本。
+  reason: 5日再平衡响应与成本均衡，历代稳定
 - name: rsi_overbought
-  default: 70
+  default: 60
   range:
-  - 60
-  - 85
+  - 55
+  - 80
   type: int
   description: RSI超买阈值，触发盈利减仓的条件之一。单位：数值。典型取值70-80，默认75略高于入场上限，减少过早止盈，保留头部利润。
-  reason: v7止盈1383次均盈利，调至70增加优质止盈，提升总盈利。
+  reason: 下调至60增加止盈触发，overbought_reduce胜率100%且均盈高
 - name: max_holding_days
   default: 60
   range:
@@ -133,15 +133,15 @@ params:
   - 60
   type: int
   description: 最大持仓交易日数，超时强制平仓。单位：交易日。典型取值15-40，默认25贴合中周期波段目标，防止被动转为长期套牢。
-  reason: v7 time_stop胜率75.9%均值1830，延长至60让趋势充分发展。
+  reason: time_stop胜率79%均盈1608，维持60让趋势充分发展
 - name: trail_stop_pct
   default: 0.18
   range:
-  - 0.03
-  - 0.2
+  - 0.05
+  - 0.25
   type: float
   description: 移动止损比例，从最高收盘价回撤该比例时触发。单位：小数。典型取值0.04-0.10，默认0.06适合10-30天波段，让利润充分发展但及时锁定。
-  reason: v7 trailing_stop触发626次均亏-1452，放宽至0.18减少噪音止损。
+  reason: 放宽至0.18减少过早出场，v9紧止损触发激增总亏损大
 - name: reduce_position_floor
   default: 0.03
   range:
@@ -149,23 +149,23 @@ params:
   - 0.06
   type: float
   description: 减仓后个股最低持仓权重，避免在震荡中彻底清仓丢失头寸。单位：小数（总资产比）。典型取值0.02-0.05，默认0.03保留微小仓位跟踪信号。
-  reason: 维持0.03底仓，跟踪信号。
+  reason: 维持0.03底仓，历代表现稳定
 - name: atr_stop_multiplier
-  default: 4.5
+  default: 3.5
   range:
   - 1.5
-  - 5.0
+  - 5.5
   type: float
   description: ATR动态止损倍数，止损距离=该倍数×ATR。单位：倍数。典型取值1.5-3.0，默认2.0在过滤市场噪音与保护趋势利润之间平衡。
-  reason: v7 volatility_stop均亏-41，上调至4.5放宽波动容忍，减少无效离场。
+  reason: 提高至3.5减少volatility_stop频繁触发，参考v8宽松表现
 - name: fixed_stop_loss_pct
-  default: 0.15
+  default: 0.14
   range:
   - 0.05
-  - 0.2
+  - 0.25
   type: float
   description: 固定止损比例，单笔最大亏损限制。单位：小数（相对成本价）。典型取值0.05-0.10，默认0.08在容忍正常波动与保护本金间取得均衡。
-  reason: v7固定止损触发1283次全亏均值-3965，放宽至0.15减少硬止损。
+  reason: 放宽至0.14减少止损频繁触发，v8总亏损更小
 - name: target_holdings
   default: 10
   range:
@@ -173,7 +173,7 @@ params:
   - 15
   type: int
   description: 目标持仓股票数量，调仓时尽量维持。单位：只。典型取值6-12，默认8在分散与集中之间平衡，确保每只股票能获得足够权重。
-  reason: 维持10只，平衡分散与收益，历代稳定。
+  reason: 10只平衡分散与集中，历代稳定
 - name: max_single_weight
   default: 0.1
   range:
@@ -181,7 +181,7 @@ params:
   - 0.2
   type: float
   description: 单只股票最大持仓权重，控制组合集中度风险。单位：小数。典型取值0.05-0.15，默认0.10与目标持仓8只匹配，实现适度分散。
-  reason: 维持0.1，匹配10只持仓，控制集中度。
+  reason: 匹配10只持仓，控制集中度风险
 - name: add_position_weight_threshold
   default: 0.7
   range:
@@ -189,15 +189,15 @@ params:
   - 1.0
   type: float
   description: 加仓信号综合得分阈值（入场信号权重和），超过该值可将个股仓位加至上限。单位：比例。典型取值0.6-0.9，默认0.7要求信号共振明显才加满。
-  reason: 维持0.7，加仓门槛合理，前期下调已增机会。
+  reason: 0.7要求信号共振明显才加仓，合理
 - name: vol_breakout_threshold
-  default: 2.2
+  default: 2.0
   range:
   - 1.0
-  - 3.5
+  - 3.0
   type: float
   description: 成交量突破倍数阈值，决定入场时的量能要求。单位：倍数。典型取值1.2-2.0，A股有效突破通常放量1.5倍以上，默认1.5平衡信号数量与质量。
-  reason: v7 breakout胜率38.7%均值113，放量高阈值有效，维持。
+  reason: 下调至2.0增加入场信号，v9过严(2.5)致breakout_entry减少
 - name: max_turnover_per_rebalance
   default: 0.5
   range:
@@ -205,7 +205,7 @@ params:
   - 0.8
   type: float
   description: 单次再平衡最大换手率，控制交易成本和冲击。单位：小数。典型取值0.30-0.70，默认0.50允许灵活调整但避免过度频繁换股。
-  reason: 维持0.5，平衡调仓灵活性与交易成本。
+  reason: 0.5平衡调仓灵活性与成本
 - name: max_industry_concentration
   default: 0.25
   range:
@@ -213,15 +213,15 @@ params:
   - 0.5
   type: float
   description: 行业暴露上限，限制同一行业总权重。单位：小数。典型取值0.20-0.40，默认0.30防止行业系统性风险过度集中，保障组合稳健。
-  reason: 维持0.25，控制行业系统性风险。
-- name: partial_profit_pct
-  default: 0.18
+  reason: 0.25控制行业系统性风险
+- name: rsi_entry_high
+  default: 65
   range:
-  - 0.05
-  - 0.3
-  type: float
-  description: 触发盈利减仓的最低累计收益率。单位：小数。典型取值0.10-0.25，默认0.15确保在已有可观利润后再执行减仓，避免微利卖出。
-  reason: 当前止盈阈值0.18已下调，维持观察，避免过早止盈截断趋势。
+  - 50
+  - 80
+  type: int
+  description: RSI入场上限，防止在严重超买时追高。单位：数值。典型取值60-80，默认70允许在较强趋势中入场，但规避极端过热状态。
+  reason: 保持65避免过度追高，历代表现稳定
 - name: reduce_position_weight_threshold
   default: 0.5
   range:
@@ -229,15 +229,15 @@ params:
   - 0.55
   type: float
   description: 减仓信号综合得分阈值（出场信号权重和），超过该值将个股仓位降至下限。单位：比例。典型取值0.2-0.4，默认0.3在趋势转弱时适度降仓。
-  reason: 维持0.5，前期上调有效，回撤改善中。
-- name: rsi_entry_high
-  default: 60
+  reason: 0.5平衡减仓响应与持仓稳定性，维持不变
+- name: partial_profit_pct
+  default: 0.1
   range:
-  - 50
-  - 80
-  type: int
-  description: RSI入场上限，防止在严重超买时追高。单位：数值。典型取值60-80，默认70允许在较强趋势中入场，但规避极端过热状态。
-  reason: v7 RSI范围窄，信号质量稳定，维持60。
+  - 0.05
+  - 0.2
+  type: float
+  description: 触发盈利减仓的最低累计收益率。单位：小数。典型取值0.10-0.25，默认0.15确保在已有可观利润后再执行减仓，避免微利卖出。
+  reason: 下调至0.10继续增加止盈，v9止盈总盈利大幅提升
 description: 基于Donchian通道突破+成交量放大+趋势与RSI过滤，配合多级止损的中周期波段策略。
 universe: 沪深 300
 holding_period: 10-30 个交易日
