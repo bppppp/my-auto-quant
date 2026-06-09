@@ -159,7 +159,19 @@ class BacktestRunner:
 
     # ===== 加载 =====
     def _load_spec(self) -> dict:
+        """加载策略 spec。
+
+        - 优先读 <name>_original.md（Stage A 生成的原版 spec）
+        - weight 模式下 _original.md 缺失时，回退到 strategiesWeight/ 最新版本
+          （_load_params / _load_weights 在 weight 模式也走 strategiesWeight/，保持一致）
+        """
         path = self.subjects_dir / self.strategy_name / f"{self.strategy_name}_original.md"
+        if not path.exists() and self.mode == "weight":
+            weight_path = self._pick_latest_version(
+                "strategiesWeight", prefix=f"{self.weight_test}_weight_v"
+            )
+            if weight_path is not None:
+                return parse_strategy_spec(weight_path)
         return parse_strategy_spec(path)
 
     def _load_params(self) -> dict:

@@ -7,6 +7,7 @@ my-quant3 autoRun 流水线主入口
 Usage:
   python pipeline.py check-env                          # 检查环境
   python pipeline.py --batch 5 --params-rounds 20 --weight-rounds 20
+  python pipeline.py --reset --batch 5 --params-rounds 20 --weight-rounds 20 清空重新来
   python pipeline.py --strategy ma_cross_atr_volume     # 单策略
   python pipeline.py --from-stage B                    # 从某阶段开始
   python pipeline.py --reset                            # 清空 state.json
@@ -19,6 +20,7 @@ import io
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -74,6 +76,79 @@ from autoRun.pipeline.translator import (  # noqa: E402
 )
 
 log = get_logger()
+
+# ========== Ctrl+C / 信号处理 ==========
+
+# 全局子进程注册表: 记录所有正在运行的 subprocess.Popen 对象
+# 当收到 SIGINT/SIGTERM 时, 遍历并强杀所有子进程, 防止孤儿进程残留
+_running_subprocesses: set[subprocess.Popen] = set()
+_interrupted = False
+# 指向当前 main_loop 的 State 实例, 用于信号处理时保存最新进度
+_current_state: "State | None" = None  # noqa: F821
+
+
+def _register_subprocess(proc: subprocess.Popen) -> None:
+    """注册一个正在运行的子进程, 用于 Ctrl+C 时级联清理."""
+    _running_subprocesses.add(proc)
+
+
+def _unregister_subprocess(proc: subprocess.Popen) -> None:
+    """子进程正常退出后注销."""
+    _running_subprocesses.discard(proc)
+
+
+def _kill_all_subprocesses() -> None:
+    """强杀所有已注册的子进程."""
+    procs = list(_running_subprocesses)
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                log.warning(f"  → 清理子进程 pid={proc.pid}")
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _running_subprocesses.discard(proc)
+
+
+def _on_interrupt(signum: int, frame) -> None:
+    """SIGINT / SIGTERM handler.
+
+    - 第一次 Ctrl+C: 保存 state, 清理子进程, 退出
+    - 第二次 Ctrl+C: 立即强退 (防止卡在 state.save())
+    """
+    global _interrupted
+    if _interrupted:
+        log.warning("⚠️ 第二次中断, 立即退出 (不保存 state)")
+        _kill_all_subprocesses()
+        os._exit(130)
+    _interrupted = True
+    log.warning(f"\n⚠️ 收到中断信号 (signal={signum}), 正在保存进度...")
+    _kill_all_subprocesses()
+    # 优先用 main_loop 中的内存 State (含最新进度), 回退到磁盘版本
+    try:
+        if _current_state is not None:
+            if _current_state.has_pending():
+                _current_state.save()
+                log.info(f"  → state.json 已保存 (内存版本)")
+        else:
+            from autoRun.pipeline.state import State, STATE_PATH
+            state = State.load()
+            if state.has_pending():
+                state.save()
+                log.info(f"  → state.json 已保存 (磁盘版本)")
+    except Exception as e:
+        log.warning(f"  ⚠️ 保存 state 失败: {e}")
+    log.warning("已退出.")
+    os._exit(130)
+
+
+# 注册信号 handler
+signal.signal(signal.SIGINT, _on_interrupt)
+signal.signal(signal.SIGTERM, _on_interrupt)
 
 
 # ========== 路径冲突解决 ==========
@@ -269,6 +344,11 @@ def run_stage_d_pick_best_params(name: str, config: PipelineConfig, state: State
     shutil.copy2(src, dst)
     log.info(f"  → 已复制 {best_v_str} → strategiesWeight/weight_v1.md (weight 调优起点)")
 
+    # 同时保存一份到策略根目录, 方便直接查看当前最佳 params
+    root_copy = subjects_dir() / name / f"{name}_{best_v_str}.md"
+    shutil.copy2(src, root_copy)
+    log.info(f"  → 已复制 {best_v_str} → {name}/ (策略根目录)")
+
     state.set_stage(name, STAGE_PICKED_PARAMS)
     state.save()
 
@@ -277,6 +357,11 @@ def run_stage_d_pick_best_params(name: str, config: PipelineConfig, state: State
 
 def run_stage_e_weight_loop(name: str, config: PipelineConfig, state: State) -> None:
     """Stage E: weight 调优 N 轮 (起点是 v1 = best params 副本)."""
+    # 前置检查: strategiesWeight/<name>_weight_v1.md 必须存在
+    weight_v1 = subjects_dir() / name / "strategiesWeight" / f"{name}_weight_v1.md"
+    if not weight_v1.exists():
+        log.warning(f"  ⚠️ weight_v1.md 不存在, 回退到 Stage D (重新复制 best params)")
+        run_stage_d_pick_best_params(name, config, state)
     log.info(f"  → weight 调优 {config.weight_rounds} 轮 (v1 是 best params 副本)")
     for round_n in range(1, config.weight_rounds + 1):
         log.info(f"  [weight {round_n}/{config.weight_rounds}]")
@@ -369,54 +454,58 @@ def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> Non
         text=True, encoding="utf-8", errors="replace",
         shell=False, bufsize=1,
     )
-    last_report = _time.time()
-    deadline = _time.time() + timeout if timeout else float("inf")
-    chunks: list[str] = []
-
-    while True:
-        if _time.time() > deadline:
-            log.error(f"    ❌ {subcommand} 超时 ({timeout}s), 强杀")
-            proc.kill()
-            raise RuntimeError(f"{subcommand} 超时 {timeout}s")
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            chunks.append(line)
-            stripped = line.strip()
-            # 关键行实时打印
-            if any(kw in stripped.lower() for kw in ("loading", "optimize", "factor", "weight", "tune", "generate", "完成", "成功", "失败", "参数", "周期", "策略")):
-                log.info(f"    | {stripped[:200]}")
-        if _time.time() - last_report > 60:
-            log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}")
-            last_report = _time.time()
-        if proc.poll() is not None:
-            if proc.stdout:
-                rest = proc.stdout.read()
-                if rest:
-                    chunks.append(rest)
-            break
-        _time.sleep(0.5)
-
-    full = "".join(chunks)
-    my_pid = proc.pid  # 记录 PID 防止误杀
-    # 显式 wait 回收 zombie
+    _register_subprocess(proc)
     try:
-        proc.wait(timeout=5)
-    except Exception:
+        last_report = _time.time()
+        deadline = _time.time() + timeout if timeout else float("inf")
+        chunks: list[str] = []
+
+        while True:
+            if _time.time() > deadline:
+                log.error(f"    ❌ {subcommand} 超时 ({timeout}s), 强杀")
+                proc.kill()
+                raise RuntimeError(f"{subcommand} 超时 {timeout}s")
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line:
+                chunks.append(line)
+                stripped = line.strip()
+                # 关键行实时打印
+                if any(kw in stripped.lower() for kw in ("loading", "optimize", "factor", "weight", "tune", "generate", "完成", "成功", "失败", "参数", "周期", "策略")):
+                    log.info(f"    | {stripped[:200]}")
+            if _time.time() - last_report > 60:
+                log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}")
+                last_report = _time.time()
+            if proc.poll() is not None:
+                if proc.stdout:
+                    rest = proc.stdout.read()
+                    if rest:
+                        chunks.append(rest)
+                break
+            _time.sleep(0.5)
+
+        full = "".join(chunks)
+        my_pid = proc.pid  # 记录 PID 防止误杀
+        # 显式 wait 回收 zombie
         try:
-            log.info(f"    → 清理 {subcommand} 进程 pid={my_pid}")
-            proc.kill()
             proc.wait(timeout=5)
         except Exception:
-            pass
-    if proc.returncode != 0:
-        log.error(f"    ❌ {subcommand} exit {proc.returncode}, 最后 20 行:")
-        for ln in full.splitlines()[-20:]:
-            log.error(f"        {ln}")
-        raise RuntimeError(
-            f"{subcommand} exit {proc.returncode}\n"
-            f"STDOUT (tail 500):\n{full[-500:]}"
-        )
-    log.info(f"    ✅ {subcommand} 完成, 总输出 {len(full)} 字符")
+            try:
+                log.info(f"    → 清理 {subcommand} 进程 pid={my_pid}")
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if proc.returncode != 0:
+            log.error(f"    ❌ {subcommand} exit {proc.returncode}, 最后 20 行:")
+            for ln in full.splitlines()[-20:]:
+                log.error(f"        {ln}")
+            raise RuntimeError(
+                f"{subcommand} exit {proc.returncode}\n"
+                f"STDOUT (tail 500):\n{full[-500:]}"
+            )
+        log.info(f"    ✅ {subcommand} 完成, 总输出 {len(full)} 字符")
+    finally:
+        _unregister_subprocess(proc)
 
 
 def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
@@ -444,64 +533,68 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
         text=True, encoding="utf-8", errors="replace",
         shell=False, bufsize=1,  # 行缓冲
     )
-    log.info(f"    → backtest 进程 pid={proc.pid}")
-
-    last_progress_report = _time.time()
-    deadline = _time.time() + timeout if timeout else float("inf")
-    stdout_chunks: list[str] = []
-
-    while True:
-        if _time.time() > deadline:
-            log.error(f"    ❌ backtest 超时 ({timeout}s), 强杀")
-            proc.kill()
-            raise RuntimeError(f"backtest {mode} 超时 {timeout}s")
-
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            stdout_chunks.append(line)
-            # 关键行: 含 "loading", "backtest", "factor", "weight", "done", "%" 等
-            stripped = line.strip()
-            if any(kw in stripped.lower() for kw in ("loading", "backtest", "factor", "weight", "computing", "running", "完成", "report", "策略", "周期", "交易", "回测", "因子", "stock", "done", "%")):
-                log.info(f"    | {stripped[:200]}")
-
-        # 60 秒无新输出就报告 (即使没关键行, 也告诉用户"还在跑")
-        if _time.time() - last_progress_report > 60:
-            log.info(f"    ⏳ backtest 仍在跑, pid={proc.pid}, 已 {_time.time() - (deadline - timeout):.0f}s")
-            last_progress_report = _time.time()
-
-        if proc.poll() is not None:
-            # 进程退出, 读完剩余
-            if proc.stdout:
-                rest = proc.stdout.read()
-                if rest:
-                    stdout_chunks.append(rest)
-            break
-
-        _time.sleep(0.5)
-
-    full_output = "".join(stdout_chunks)
-    my_pid = proc.pid  # 记录 PID 防止误杀 (Popen 持有, 不影响外部进程)
-    # 显式 wait 回收 zombie 进程 (防止进程残留)
+    _register_subprocess(proc)
     try:
-        proc.wait(timeout=5)
-    except Exception:
+        log.info(f"    → backtest 进程 pid={proc.pid}")
+
+        last_progress_report = _time.time()
+        deadline = _time.time() + timeout if timeout else float("inf")
+        stdout_chunks: list[str] = []
+
+        while True:
+            if _time.time() > deadline:
+                log.error(f"    ❌ backtest 超时 ({timeout}s), 强杀")
+                proc.kill()
+                raise RuntimeError(f"backtest {mode} 超时 {timeout}s")
+
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line:
+                stdout_chunks.append(line)
+                # 关键行: 含 "loading", "backtest", "factor", "weight", "done", "%" 等
+                stripped = line.strip()
+                if any(kw in stripped.lower() for kw in ("loading", "backtest", "factor", "weight", "computing", "running", "完成", "report", "策略", "周期", "交易", "回测", "因子", "stock", "done", "%")):
+                    log.info(f"    | {stripped[:200]}")
+
+            # 60 秒无新输出就报告 (即使没关键行, 也告诉用户"还在跑")
+            if _time.time() - last_progress_report > 60:
+                log.info(f"    ⏳ backtest 仍在跑, pid={proc.pid}, 已 {_time.time() - (deadline - timeout):.0f}s")
+                last_progress_report = _time.time()
+
+            if proc.poll() is not None:
+                # 进程退出, 读完剩余
+                if proc.stdout:
+                    rest = proc.stdout.read()
+                    if rest:
+                        stdout_chunks.append(rest)
+                break
+
+            _time.sleep(0.5)
+
+        full_output = "".join(stdout_chunks)
+        my_pid = proc.pid  # 记录 PID 防止误杀 (Popen 持有, 不影响外部进程)
+        # 显式 wait 回收 zombie 进程 (防止进程残留)
         try:
-            log.info(f"    → 清理 backtest 进程 pid={my_pid}")
-            proc.kill()
             proc.wait(timeout=5)
         except Exception:
-            pass
-    if proc.returncode != 0:
-        # 打印最后 30 行帮诊断
-        last_lines = full_output.splitlines()[-30:]
-        log.error(f"    ❌ backtest {mode} exit {proc.returncode}, 最后 30 行输出:")
-        for ln in last_lines:
-            log.error(f"        {ln}")
-        raise RuntimeError(
-            f"backtest {mode} exit {proc.returncode}\n"
-            f"STDOUT (tail 500):\n{full_output[-500:]}"
-        )
-    log.info(f"    ✅ backtest 完成, exit=0, 总输出 {len(full_output)} 字符")
+            try:
+                log.info(f"    → 清理 backtest 进程 pid={my_pid}")
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if proc.returncode != 0:
+            # 打印最后 30 行帮诊断
+            last_lines = full_output.splitlines()[-30:]
+            log.error(f"    ❌ backtest {mode} exit {proc.returncode}, 最后 30 行输出:")
+            for ln in last_lines:
+                log.error(f"        {ln}")
+            raise RuntimeError(
+                f"backtest {mode} exit {proc.returncode}\n"
+                f"STDOUT (tail 500):\n{full_output[-500:]}"
+            )
+        log.info(f"    ✅ backtest 完成, exit=0, 总输出 {len(full_output)} 字符")
+    finally:
+        _unregister_subprocess(proc)
 
 
 def parse_latest(name: str, mode: str) -> dict:
@@ -516,7 +609,9 @@ STAGE_ORDER = ["A", "B", "C", "D", "E", "F", "H"]
 
 
 def main_loop(args, config: PipelineConfig) -> int:
+    global _current_state
     state = State.load() if not args.reset else State()
+    _current_state = state  # 让 Ctrl+C handler 能保存最新进度
     if not state.started_at:
         state.started_at = ""
 
@@ -786,7 +881,12 @@ def main(argv: list[str] | None = None) -> int:
 
     banner("my-quant3 pipeline 启动", char="=")
     log.info(f"  配置文件: {config}")
-    return main_loop(args, config)
+    try:
+        return main_loop(args, config)
+    except KeyboardInterrupt:
+        log.warning("\n⚠️ 用户中断 (KeyboardInterrupt), 正在退出...")
+        _kill_all_subprocesses()
+        return 130
 
 
 if __name__ == "__main__":
