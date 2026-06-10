@@ -1,22 +1,33 @@
 # debug_mode: params / monitor
-# strategy: ma_rsi_bb_vol_swing_1
+# strategy: trend_momentum_atr_vol_1
 # version: v1 (baseline)
 # purpose: 由 LLM 从 _original.md 翻译
 # date: 2026-06-09
 # mode: params (默认) | weight
 # run:   single (默认) | --monitor
+# --- monitor 监听目录 ---
+#   params 模式 → strategiesParam/  下新增 *_v<n>.md          文件触发
+#   weight 模式 → strategiesWeight/ 下新增 *_weight_v<n>.md  文件触发
+#   debounce 5s, Ctrl+C 退出
+# --- monitor cwd 要求 ---
+#   monitor 模式下 watch_dir 改用绝对路径
+# --- CONFIG 最高优先级 ---
+#   test_universe / start_date / end_date / limit
 # command: python generated/strategy.py
 # command: python generated/strategy.py params
 # command: python generated/strategy.py weight
 # command: python generated/strategy.py --monitor
 # command: python generated/strategy.py weight --monitor
-# command: python generated/strategy.py weight --weight-test ma_rsi_bb_vol_swing_1
+# command: python generated/strategy.py weight --weight-test trend_momentum_atr_vol_1
 
-"""ma_rsi_bb_vol_swing_1 策略. 由 LLM 从 _original.md 翻译.
+"""trend_momentum_atr_vol_1 策略. 由 LLM 从 _original.md 翻译.
 
-按 subject_structure.md §4.6 模式手写. 包含 3 个方法:
+双均线金叉+ATR波动率扩张+量能放大确认，打分制入场，三层止损出场的中周期波段策略。
+
+按 subject_structure.md §4.6 模式手写. 包含 4 个方法:
 - compute_factors(df, params) -> {factor_name: Series}
 - entry_score(factors, params, weights) -> float
+- get_triggered_signals(factors, params, weights) -> list[str]
 - should_exit(position, factors, params, weights) -> signal_name | None
 """
 from __future__ import annotations
@@ -34,12 +45,8 @@ _SUBJECTS_DIR = _HERE.parents[2]
 if str(_SUBJECTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SUBJECTS_DIR))
 
-from subject.factors import (  # noqa: E402
-    ma, atr, rsi, volume_ratio,
-)
-from subject.conditions import (  # noqa: E402
-    check_fixed_stop, check_trailing_stop, check_time_stop,
-)
+from subject.factors import ma, atr, volume_ratio  # noqa: E402
+from subject.conditions import check_fixed_stop, check_trailing_stop, check_time_stop  # noqa: E402
 
 
 # ====================================================================
@@ -64,68 +71,71 @@ class StrategyConfig:
 
 # === 在这里配置 (None = 不覆盖) ===
 CONFIG = StrategyConfig(
-    test_universe=None,
-    start_date="2024-01-01",
+    test_universe=["000001.SZ", "000002.SZ", "600000.SH", "600519.SH", "000333.SZ"],
+    start_date="2024-06-01",
     end_date="2024-12-31",
-    limit=None,
+    limit=5,
 )
 
 
 class Strategy:
     def compute_factors(self, df: pd.DataFrame, params: dict) -> dict:
+        """计算所有技术指标因子.
+
+        注意: highest_close_since_entry 是持仓状态字段, 通过 position["highest"] 访问,
+        不在此计算.
+        """
         return {
             "close": df["收盘价"],
-            "high": df["最高价"],
-            "low": df["最低价"],
-            "open": df["开盘价"],
-            "volume": df["成交量（股）"],
-            "ma_5": ma(df["收盘价"], 5),
-            "ma_20": ma(df["收盘价"], 20),
-            "ma_60": ma(df["收盘价"], 60),
-            "rsi_14": rsi(df["收盘价"], 14),
-            "bb_middle": ma(df["收盘价"], 20),  # 20日布林带中轨 = 20日均线
+            "ma_10": ma(df["收盘价"], 10),
+            "ma_30": ma(df["收盘价"], 30),
             "atr_14": atr(df["最高价"], df["最低价"], df["收盘价"], 14),
             "volume_ratio_20": volume_ratio(df["成交量（股）"], 20),
         }
 
     def entry_score(self, factors: dict, params: dict, weights: dict) -> float:
+        """入场打分: 三个入场信号独立计算, 满足则获得对应权重.
+
+        信号权重: ma_golden_cross=0.50, atr_expand=0.25, volume_confirm=0.25
+        总分 >= min_entry_score 时进入候选池.
+        """
         score = 0.0
         ew = weights["entry"]
 
-        # trend_following (AND): ma_5 > ma_20 AND close > ma_60
-        if (factors["ma_5"] > factors["ma_20"]).iloc[-1] and (factors["close"] > factors["ma_60"]).iloc[-1]:
-            score += ew["trend_following"]
+        # ma_golden_cross (AND): ma_10 > ma_30
+        if (factors["ma_10"] > factors["ma_30"]).iloc[-1]:
+            score += ew["ma_golden_cross"]
 
-        # momentum_breakout (AND): rsi_14 > rsi_threshold AND close > bb_middle + bb_band_offset * atr_14
-        if (factors["rsi_14"] > params["rsi_threshold"]).iloc[-1] and (
-            factors["close"] > factors["bb_middle"] + params["bb_band_offset"] * factors["atr_14"]
-        ).iloc[-1]:
-            score += ew["momentum_breakout"]
+        # atr_expand (单因子): atr_14 / close > atr_threshold
+        if (factors["atr_14"] / factors["close"] > params["atr_threshold"]).iloc[-1]:
+            score += ew["atr_expand"]
 
-        # volume_surge (单因子): volume_ratio_20 > volume_breakout_ratio
-        if (factors["volume_ratio_20"] > params["volume_breakout_ratio"]).iloc[-1]:
-            score += ew["volume_surge"]
+        # volume_confirm (单因子): volume_ratio_20 > vol_threshold
+        if (factors["volume_ratio_20"] > params["vol_threshold"]).iloc[-1]:
+            score += ew["volume_confirm"]
 
         return score
 
     def get_triggered_signals(self, factors: dict, params: dict, weights: dict) -> list[str]:
         """返回触发入场的信号名列表（供 runner 记录事件用）。
+
         此方法的触发条件必须与 entry_score 中的条件保持一致。
         """
-        triggered = []
-        if (factors["ma_5"] > factors["ma_20"]).iloc[-1] and (factors["close"] > factors["ma_60"]).iloc[-1]:
-            triggered.append("trend_following")
-        if (factors["rsi_14"] > params["rsi_threshold"]).iloc[-1] and (
-            factors["close"] > factors["bb_middle"] + params["bb_band_offset"] * factors["atr_14"]
-        ).iloc[-1]:
-            triggered.append("momentum_breakout")
-        if (factors["volume_ratio_20"] > params["volume_breakout_ratio"]).iloc[-1]:
-            triggered.append("volume_surge")
+        triggered: list[str] = []
+        if (factors["ma_10"] > factors["ma_30"]).iloc[-1]:
+            triggered.append("ma_golden_cross")
+        if (factors["atr_14"] / factors["close"] > params["atr_threshold"]).iloc[-1]:
+            triggered.append("atr_expand")
+        if (factors["volume_ratio_20"] > params["vol_threshold"]).iloc[-1]:
+            triggered.append("volume_confirm")
         return triggered
 
     def should_exit(self, position: dict, factors: dict, params: dict, weights: dict) -> Optional[str]:
+        """出场判断: 按权重降序轮询, 高优先级信号先触发先返回.
+
+        优先级链: fixed_stop(0.40) > trailing_stop(0.30) > time_stop(0.20) > ma_death_cross(0.10)
+        """
         ew = weights["exit"]
-        # 按 exit_weights 降序遍历，weight 高的信号先检查
         for sig in sorted(ew, key=ew.get, reverse=True):
             if sig == "fixed_stop":
                 if check_fixed_stop(position["current_price"], position["entry_price"], params["fixed_stop_pct"]):
@@ -136,9 +146,9 @@ class Strategy:
             elif sig == "time_stop":
                 if check_time_stop(position["holding_days"], params["max_holding_days"]):
                     return "time_stop"
-            elif sig == "trend_reversal":
-                if (factors["ma_5"] < factors["ma_20"]).iloc[-1] and (factors["close"] < factors["ma_60"]).iloc[-1]:
-                    return "trend_reversal"
+            elif sig == "ma_death_cross":
+                if (factors["ma_10"] < factors["ma_30"]).iloc[-1]:
+                    return "ma_death_cross"
         return None
 
 
@@ -157,7 +167,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         prog="strategy.py",
-        description="ma_rsi_bb_vol_swing_1 策略回测入口",
+        description="trend_momentum_atr_vol_1 策略回测入口",
     )
     parser.add_argument("mode", nargs="?", default="params", choices=["params", "weight"])
     parser.add_argument("--monitor", action="store_true")
@@ -173,13 +183,13 @@ if __name__ == "__main__":
         eff_start_date = CONFIG.start_date if CONFIG.start_date is not None else args.start_date
         eff_end_date = CONFIG.end_date if CONFIG.end_date is not None else args.end_date
         eff_limit = CONFIG.limit
-        eff_weight_test = args.weight_test if args.weight_test else "ma_rsi_bb_vol_swing_1"
+        eff_weight_test = args.weight_test if args.weight_test else "trend_momentum_atr_vol_1"
 
         if eff_test_universe is not None or eff_limit is not None or CONFIG.start_date is not None or CONFIG.end_date is not None or args.weight_test:
             print(f"[CONFIG] test_universe={eff_test_universe} start={eff_start_date} end={eff_end_date} limit={eff_limit} weight_test={eff_weight_test}")
 
         from subject.cli.main import main
-        cli_args = ["run", "--strategy", "ma_rsi_bb_vol_swing_1", "--mode", args.mode]
+        cli_args = ["run", "--strategy", "trend_momentum_atr_vol_1", "--mode", args.mode]
         cli_args += ["--weight-test", eff_weight_test]
         if eff_test_universe is not None:
             cli_args += ["--test-universe", ",".join(eff_test_universe)]
@@ -233,8 +243,10 @@ if __name__ == "__main__":
     observer.start()
 
     import signal as _signal
+
     def _handle_sigint(signum, frame):
         stop_event.set()
+
     try:
         _signal.signal(_signal.SIGINT, _handle_sigint)
     except (ValueError, OSError):
