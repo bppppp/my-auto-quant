@@ -73,9 +73,13 @@ autoRun/.state_*.json.tmp
 strategies/log/
 
 # ============================================
-# subjects/ 各策略的 backtest 日志 (每次跑都生成新文件)
+# subjects/ 各策略运行时产物 (autoRun 生成, 每次跑都变)
 # ============================================
 subjects/*/log/
+subjects/*/reportParams/
+subjects/*/reportWeight/
+subjects/*/strategiesParam/
+subjects/*/strategiesWeight/
 
 # ============================================
 # 通用日志
