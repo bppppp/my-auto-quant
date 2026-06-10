@@ -1,8 +1,10 @@
 """一次性预计算公共因子 → data/data-by-stock-factor/{code}_factor.csv.
 
 使用:
-    python subjects/pre_compute_factor.py                  # 增量(基于 mtime)
+    python subjects/pre_compute_factor.py                  # 增量(基于 mtime), 仅 HS300+CSI1000+CYB_STAR_50
+    python subjects/pre_compute_factor.py --all            # 全量: data-by-stock/ 下所有股票
     python subjects/pre_compute_factor.py --force          # 强制全量
+    python subjects/pre_compute_factor.py --all --force    # 全部股票 + 强制重算
     python subjects/pre_compute_factor.py --codes 000001,000002   # 指定股票
 """
 from __future__ import annotations
@@ -92,14 +94,28 @@ def list_target_codes() -> list[str]:
     return out
 
 
+def list_all_codes() -> list[str]:
+    """返回 data/data-by-stock/ 下所有股票的 6 位代码 (去重, 排序)."""
+    codes: list[str] = []
+    for f in SOURCE_DIR.glob("*_金玥数据.csv"):
+        code = f.stem.replace("_金玥数据", "")
+        if code.isdigit() and len(code) == 6:
+            codes.append(code)
+    codes.sort()
+    return codes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="忽略 mtime, 全量重算")
+    parser.add_argument("--all", action="store_true", dest="all_stocks", help="处理 data-by-stock/ 下全部股票 (默认仅 HS300+CSI1000+CYB_STAR_50)")
     parser.add_argument("--codes", type=str, default="", help="指定股票代码, 逗号分隔")
     args = parser.parse_args()
 
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+    elif args.all_stocks:
+        codes = list_all_codes()
     else:
         codes = list_target_codes()
 
