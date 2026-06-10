@@ -23,6 +23,7 @@
 | [分仓/期货/两融](#13-分仓期货两融) | `set_subportfolios` `transfer_cash` `get_dominant_future` `margincash_*` | 多账户 & 衍生品 |
 | [工具函数](#14-工具函数) | `record` `log` `write_file` `read_file` `create_backtest` `get_backtest` | 日志 & IO |
 | [关键规则](#15-关键规则) | 撮合/复权/停牌/限制/时间线 | 避坑速查 |
+| [常见坑点](#16-常见坑点--jqboson-引擎兼容性-quirks) | `sum(dict_values)` / `order_value` 语义 / 退市保护 / 模拟盘交易日 | 兼容性 Quirks |
 
 ---
 
@@ -52,6 +53,83 @@ def market_open(context):
     elif current_price < MA5 and pos > 0:
         order_target(g.security, 0)       # 全仓卖出
     record(stock_price=current_price)
+```
+
+### 0.1 完整生命周期示例 (含 before/after 回调)
+
+```python
+# 导入函数库
+from jqdata import *
+
+# 初始化函数，设定基准等等
+def initialize(context):
+    # 设定沪深300作为基准
+    set_benchmark('000300.XSHG')
+    # 开启动态复权模式(真实价格)
+    set_option('use_real_price', True)
+    # 输出内容到日志 log.info()
+    log.info('初始函数开始运行且全局只运行一次')
+    # 过滤掉order系列API产生的比error级别低的log
+    # log.set_level('order', 'error')
+
+    ### 股票相关设定 ###
+    # 股票类每笔交易时的手续费是：买入时佣金万分之三，卖出时佣金万分之三加千分之一印花税, 每笔交易佣金最低扣5块钱
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
+
+    ## 运行函数（reference_security为运行时间的参考标的；传入的标的只做种类区分，因此传入'000300.XSHG'或'510300.XSHG'是一样的）
+      # 开盘前运行
+    run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
+      # 开盘时运行
+    run_daily(market_open, time='open', reference_security='000300.XSHG')
+      # 收盘后运行
+    run_daily(after_market_close, time='after_close', reference_security='000300.XSHG')
+
+## 开盘前运行函数
+def before_market_open(context):
+    # 输出运行时间
+    log.info('函数运行时间(before_market_open)：'+str(context.current_dt.time()))
+
+    # 给微信发送消息（添加模拟交易，并绑定微信生效）
+    # send_message('美好的一天~')
+
+    # 要操作的股票：平安银行（g.为全局变量）
+    g.security = '000001.XSHE'
+
+## 开盘时运行函数
+def market_open(context):
+    log.info('函数运行时间(market_open):'+str(context.current_dt.time()))
+    security = g.security
+    # 获取股票的收盘价
+    close_data = get_bars(security, count=5, unit='1d', fields=['close'])
+    # 取得过去五天的平均价格
+    MA5 = close_data['close'].mean()
+    # 取得上一时间点价格
+    current_price = close_data['close'][-1]
+    # 取得当前的现金
+    cash = context.portfolio.available_cash
+
+    # 如果上一时间点价格高出五天平均价1%, 则全仓买入
+    if (current_price > 1.01*MA5) and (cash > 0):
+        # 记录这次买入
+        log.info("价格高于均价 1%%, 买入 %s" % (security))
+        # 用所有 cash 买入股票
+        order_value(security, cash)
+    # 如果上一时间点价格低于五天平均价, 则空仓卖出
+    elif current_price < MA5 and context.portfolio.positions[security].closeable_amount > 0:
+        # 记录这次卖出
+        log.info('价格低于均价, 卖出 %s' % (security))
+        # 卖出所有股票,使这只股票的最终持有量为0
+        order_target(security, 0)
+
+## 收盘后运行函数
+def after_market_close(context):
+    log.info(str('函数运行时间(after_market_close):'+str(context.current_dt.time())))
+    #得到当天所有成交记录
+    trades = get_trades()
+    for _trade in trades.values():
+        log.info('成交记录：'+str(_trade))
+    log.info('一天结束')
+    log.info('##############################################################')
 ```
 
 ---
@@ -1076,3 +1154,210 @@ enable_profile()
 |------|----------|-----------|-----------------|------------------|------------------------|----------------|
 | stock | 0 | 0.001 | 0.0003 | 0.0003 | 0 | 5 |
 | index_futures | 0 | 0 | 0.000023 | 0.000023 | 0.0023 | 0 |
+
+---
+
+## 16. 常见坑点 / JQBoson 引擎兼容性 Quirks
+
+> 以下为聚宽 JQBoson 回测引擎(Python 3.6 环境)的非标准行为,在原生 CPython 中正常,在聚宽中会**静默出错**。从其他平台移植策略时务必逐一排查。
+
+### 16.1 `sum(dict.values())` 不会归约
+
+**症状**:
+```python
+d = {'a': 1.0, 'b': 2.0, 'c': 3.0}
+x = sum(d.values())
+# 标准 CPython: x = 6.0 (float)
+# 聚宽 JQBoson:  x = dict_values([1.0, 2.0, 3.0]) ← 仍是 dict_values, 不会归约!
+y = x / 100.0
+# TypeError: unsupported operand type(s) for /: 'dict_values' and 'float'
+```
+
+**触发场景**:对 `dict.values()` / `dict.items()` / `pd.Series.values` 等迭代器直接 `sum()`。
+
+**修复**:**必须**先转 `list` 再 sum。
+```python
+# ❌ 错误
+total = sum(d.values())
+
+# ✅ 正确
+total = sum([d[_k] for _k in d])
+
+# ✅ 同样正确 (仅当 value 一定是数值时)
+total = sum(list(d.values()))
+```
+
+**额外建议**:对 `total_value`、`available_cash` 这类除数先做 `> 0` 守卫,避免空 dict 触发除零。
+
+### 16.2 `order_value` 是"追加",不是"调仓到目标"
+
+**症状**:
+```python
+# 已持有 1000 元股票, 想调仓到 5000 元
+order_value(stock, 5000)
+# 期望: 持仓变为 5000 元
+# 实际: 持仓变为 6000 元 (追加 5000)
+```
+
+**修复**:调仓场景必须用 `order_target_value`:
+```python
+# ✅ 正确
+order_target_value(stock, 5000)   # 持仓变为 5000
+order_target_value(stock, 0)      # 全部卖出
+```
+
+`order_value` 仅适用于"想再补仓 N 元"的场景。
+
+### 16.3 `cd[stock]` 对退市/异常股票抛 KeyError
+
+**症状**:`get_current_data()` 返回的 dict 不包含退市/退市整理期/数据缺失的股票,直接 `cd[s].paused` 抛 KeyError 终止策略。
+
+**修复**:用 `cd.get(s)` 拿 None,或 `try/except` 守护。
+```python
+# ❌ 错误
+if cd[s].paused: continue
+
+# ✅ 正确
+d = cd.get(s)
+if d is None or d.paused: continue
+```
+
+### 16.4 `get_current_data()` 没有 `volume` 字段
+
+`cd[stock]` 只有 `last_price, high_limit, low_limit, paused, is_st, day_open, name, industry_code`,**无 `volume` / `money` / `avg`**。
+
+`history()` / `attribute_history()` 同样**不含当天**(收盘后也不含)。如需当日量比,只能:
+1. 用昨天成交量近似(1 日滞后,大多数场景可接受)
+2. 用 `get_bars(..., include_now=True, ...)` 在 14:55 取当日未完成 bar
+
+### 16.5 `high_limit` / `low_limit` 可能为 0
+
+新股上市首日 / 数据缺失时,这两个字段可能为 0,直接比较 `last_price >= high_limit` 会**恒真**(last_price ≥ 0),导致永远跳过买入/卖出。
+
+**修复**:加 `> 0` 守卫。
+```python
+# ❌ 错误
+if last_price >= cd[stock].high_limit: continue
+
+# ✅ 正确
+if cd[stock].high_limit > 0 and last_price >= cd[stock].high_limit: continue
+```
+
+### 16.6 模拟盘 `run_daily` 每日触发(含周末/节假日)
+
+**回测**:`run_daily` 仅在交易日触发。
+
+**模拟盘**:`run_daily` 文档写"每天 09:00 执行",会**每日触发**。`g.rebalance_counter += 1` 在周末递增,会破坏 `rebalance_freq_days` 的"交易日"语义。
+
+**修复**:在每个回调开头加交易日守卫。
+```python
+def _is_trading_day(context):
+    today = np.datetime64(context.current_dt.date())
+    return today in g.trade_days_set  # 启动时缓存 get_all_trade_days()
+
+def before_market_open(context):
+    if not _is_trading_day(context):
+        return
+    ...
+```
+
+### 16.7 涨跌停/停牌时 `order_target_value` 自动挂单,不会失败
+
+当股票**跌停封板**或**停牌**时调用 `order_target_value(stock, 0)`,**不会**返回 `None`,而是返回一个**挂单** Order,等股票打开跌停/复牌后自动撮合,无须次日重发。
+
+**因此**:`execute_rebalance` 清仓段遇到跌停/停牌**不需要**跳过,直接发单即可。`if sell_order is None` 永远为 False。
+
+### 16.8 科创板 (688xxx) 市价单需要指定保护限价
+
+**症状**:下单科创板股票时报错:
+```
+订单委托失败: StockOrder(security=688981.XSHG mode=OrderAmount ...
+  error=科创板市价单需要指定保护限价,取值必须大于 0 且小于 1 万元)
+```
+
+**原因**:聚宽对**科创板 (688xxx)**的市价单 (`MarketOrderStyle`)有特殊限制——
+交易所规则要求市价单必须带"保护限价"(price collar),防止市价单瞬间打到极端价位。
+因此 `order(stock, shares)` (默认市价单) 在科创板上会失败。
+
+**修复**:对科创板单独用 `LimitOrderStyle(limit_price)` 下限价单:
+```python
+# ❌ 错误 (科创板会失败)
+if stock.startswith('688'):
+    order(stock, delta_shares)  # 默认 MarketOrderStyle → 失败
+
+# ✅ 正确 (科创板用限价单)
+if stock.startswith('688'):
+    limit_price = min(last_price * 1.005, 9999.99)  # 略高于当前价, 保险成交
+    order(stock, delta_shares, LimitOrderStyle(limit_price))
+else:
+    order(stock, delta_shares)  # 主板/中小创仍用市价单
+```
+
+**关键约束**:
+- 限价必须 `> 0`
+- 限价必须 `< 10000` 元(科创板高价股用 `last_price * 1.005` 通常满足)
+- 限价 `last_price * 1.005` 比当前价高 0.5%,既能成交又防止异常
+
+**适用场景**:HS300 / 科创50 / 任何包含科创板的 universe。代码里用 `stock.startswith('688')` 判定。
+
+### 16.9 `order_target_value` / `order_value` 内部"下单数量为0"假报
+
+**症状**:用户计算的目标股数明显 > 0(例如 58 lots),JQuant 仍报:
+```
+下单失败,初步检查下单数量为0: OrderTargetValue(_value=25584.0 style=MarketOrderStyle ...)
+```
+
+**修复**:用 `order(stock, delta_shares)` 直接传股数,自己算 `target_shares` 和 `current_shares`:
+```python
+# ❌ 错误 (偶尔报"数量为0")
+order_target_value(stock, value)
+order_value(stock, value)
+
+# ✅ 正确 (精确控制)
+target_shares = int(value // (lot_size * last_price)) * lot_size
+current_shares = pos.total_amount if pos else 0
+delta_shares = target_shares - current_shares
+order(stock, delta_shares)  # 直接传股数, JQuant 不再内部推算
+```
+
+**额外提示**:科创板 + `order_target_value` 双重触发,**双重失败**——既要 16.8 的限价单,又要避开 16.9 的股数 0 bug。
+
+### 16.10 `g.params = PARAMS` 可能丢失长列表 / 嵌套结构
+
+**症状**:`KeyError: 'xxx'` 出现在 PARAMS dict 里**明明有**的键。
+
+**原因**:聚宽 JQBoson 对全局变量 `g.params` 写入有大小/嵌套深度限制,如果 PARAMS 中含**长度 > ~100 的 list** (如 300 只股票池)、**多层嵌套 dict** 等复杂结构,会被**截断或丢弃**,导致 `g.params` 中缺失部分键。
+
+**修复**:把大列表/嵌套结构放到独立的模块级变量,而不是放在 PARAMS 里:
+```python
+# ❌ 错误 (PARAMS 含 300 项列表 → g.params = PARAMS 后丢键)
+PARAMS = {
+    'universe_index': '000300.XSHG',
+    'static_universe': True,
+    'hs300_codes': [300 个代码],   # ← 这个列表会让 PARAMS 过大
+    'ma_long': 30,
+    'atr_threshold': 0.08,
+    ...
+}
+g.params = PARAMS
+# KeyError: 'ma_long'  ← ma_long 在 PARAMS 中, 但 g.params 中丢了!
+
+# ✅ 正确 (大列表拆到独立模块级变量)
+PARAMS = {
+    'universe_index': '000300.XSHG',
+    'static_universe': True,
+    'ma_long': 30,
+    'atr_threshold': 0.08,
+    ...
+}
+HS300_STATIC = [300 个代码]  # ← 独立的模块级 list
+g.params = PARAMS  # PARAMS 中所有键都保留
+# 在 before_market_open 中:
+if PARAMS.get('static_universe', False):
+    raw = list(HS300_STATIC)  # 直接引用模块级变量
+```
+
+**经验法则**:
+- PARAMS 中**只放标量**(int / float / bool / 短字符串)
+- 长列表 / dict / 嵌套结构 → 独立模块级常量
+
