@@ -19,7 +19,8 @@ logging.basicConfig(level=logging.WARNING)
 from subject.backtest.runner import BacktestRunner
 from subject.backtest.data_loader import load_stock
 from subject.backtest.a_share_rules import (
-    can_buy, can_sell, is_limit_up, is_limit_down, is_one_word_board, is_one_word_down,
+    can_buy, can_buy_at_open, can_sell, can_sell_at_open,
+    is_limit_up, is_limit_down, is_one_word_board, is_one_word_down,
 )
 from importlib.util import spec_from_file_location, module_from_spec
 
@@ -41,14 +42,22 @@ def get_bar(code, date):
 
 
 def get_factors(strategy, code, date, params):
+    """T-1 因子: hist["日期"] < date, 即 date 前一天及之前."""
     hist = load_stock(code.split(".")[0])
-    sub = hist[hist["日期"] <= date].sort_values("日期").reset_index(drop=True)
+    sub = hist[hist["日期"] < date].sort_values("日期").reset_index(drop=True)
     if len(sub) < 20:
         return None
     return strategy.compute_factors(sub, params)
 
 
 def replay_params(strategy, params, weights, code, start, end):
+    """回放 params 模式单只股的回测. 与 runner._backtest_single_stock 保持一致:
+
+    - T-1 因子 (df.iloc[:i], 不含今天)
+    - T 开盘成交 (用 open, 不是 close)
+    - Day 0 跳过 (无 T-1 数据, 不交易)
+    - 期末强制平仓 (用 last close 估算 PnL, signal='end_of_data')
+    """
     df = load_stock(code.split(".")[0])
     df = df[df["日期"] >= pd.Timestamp(start)]
     df = df[df["日期"] <= pd.Timestamp(end)]
@@ -58,30 +67,38 @@ def replay_params(strategy, params, weights, code, start, end):
     per_stock_capital = 1_000_000 * params.get("max_single_weight", 0.10)
     pos = None
     trades = []
+    prev_close = None
     for i in range(len(df)):
         bar = df.iloc[i]
         date = bar["日期"]
+        open_px = float(bar["开盘价"])
         close = float(bar["收盘价"])
-        factors = strategy.compute_factors(df.iloc[:i+1], params)
+
+        if i == 0:
+            prev_close = close
+            continue
+
+        factors = strategy.compute_factors(df.iloc[:i], params)
+
         if pos is not None:
             pos["highest"] = max(pos["highest"], close)
             pos["holding_days"] = (date - pos["entry_date"]).days
             pos_dict = {
-                "current_price": close,
+                "current_price": prev_close,
                 "entry_price": pos["entry_price"],
                 "highest": pos["highest"],
                 "holding_days": pos["holding_days"],
             }
             sig = strategy.should_exit(pos_dict, factors, params, weights)
-            if sig and can_sell(bar):
+            if sig and can_sell_at_open(bar, prev_close, code):
                 trades.append({
                     "code": code,
                     "entry_date": pos["entry_date"],
                     "entry_price": pos["entry_price"],
                     "exit_date": date,
-                    "exit_price": close,
+                    "exit_price": open_px,
                     "exit_signal": sig,
-                    "pnl": (close - pos["entry_price"]) * pos["shares"],
+                    "pnl": (open_px - pos["entry_price"]) * pos["shares"],
                     "holding_days": pos["holding_days"],
                     "highest": pos["highest"],
                     "shares": pos["shares"],
@@ -89,20 +106,42 @@ def replay_params(strategy, params, weights, code, start, end):
                 pos = None
         if pos is None:
             score = strategy.entry_score(factors, params, weights)
-            if score > 0 and can_buy(bar):
-                shares = int(per_stock_capital / close / 100) * 100
+            if score > 0 and can_buy_at_open(bar, prev_close, code):
+                shares = int(per_stock_capital / open_px / 100) * 100
                 if shares > 0:
                     pos = {
                         "entry_date": date,
-                        "entry_price": close,
+                        "entry_price": open_px,
                         "shares": shares,
-                        "highest": close,
+                        "highest": open_px,
                     }
+        prev_close = close
+
+    # 期末强制平仓
+    if pos is not None:
+        last_close = float(df.iloc[-1]["收盘价"])
+        trades.append({
+            "code": code,
+            "entry_date": pos["entry_date"],
+            "entry_price": pos["entry_price"],
+            "exit_date": df.iloc[-1]["日期"],
+            "exit_price": last_close,
+            "exit_signal": "end_of_data",
+            "pnl": (last_close - pos["entry_price"]) * pos["shares"],
+            "holding_days": pos["holding_days"],
+            "highest": pos["highest"],
+            "shares": pos["shares"],
+        })
+
     return trades
 
 
 def verify_trade(strategy, params, weights, t):
-    """单笔交易核对. 返回 (entry_ok, exit_ok, priority_ok, all_triggers, ash_ok)."""
+    """单笔交易核对. 与新模型 (T-1 因子 + T 开盘成交) 一致.
+
+    注: trailing_stop / fixed_stop 的触发价 = T-1 收盘 (策略决策时看到的"当前价")
+        而非 T 收盘. 其它信号 (ma_death_cross / time_stop) 与价格无关, 不变.
+    """
     out = {"entry": None, "exit": None, "priority": None, "ash_entry": None, "ash_exit": None}
 
     # ===== ENTRY =====
@@ -120,7 +159,11 @@ def verify_trade(strategy, params, weights, t):
         out["entry"] = (entry_ok, fv, atr_ok, vol_ok, ma_cross)
     bar = get_bar(t["code"], t["entry_date"])
     if bar is not None:
-        cb = can_buy(bar)
+        # A 股规则: T 开盘成交, 用 T-1 收盘判定一字板
+        hist = load_stock(t["code"].split(".")[0])
+        sub_signal = hist[hist["日期"] < t["entry_date"]].sort_values("日期").reset_index(drop=True)
+        prev_close = float(sub_signal.iloc[-1]["收盘价"]) if len(sub_signal) else 0.0
+        cb = can_buy_at_open(bar, prev_close, t["code"])
         out["ash_entry"] = (cb, is_limit_up(bar), bool(bar.get("是否ST", False)),
                             is_one_word_board(bar) and is_limit_up(bar), bar.get("涨幅%"))
 
@@ -130,26 +173,41 @@ def verify_trade(strategy, params, weights, t):
         out["exit"] = (False, "no_factors")
     else:
         fv = {k: float(v.iloc[-1]) for k, v in f.items()}
+        # T-1 收盘价 (= prev_close) 作为止损决策时的"当前价"
+        hist = load_stock(t["code"].split(".")[0])
+        sub_signal = hist[hist["日期"] < t["exit_date"]].sort_values("日期").reset_index(drop=True)
+        prev_close = float(sub_signal.iloc[-1]["收盘价"]) if len(sub_signal) else 0.0
         # 每个信号都检查 (独立看), 看哪个真的触发了
         all_trig = {}
         all_trig["ma_death_cross"] = fv["ma_5"] < fv["ma_20"]
-        all_trig["trailing_stop"] = fv["close"] < t["highest"] * (1 - params["trailing_stop_pct"])
-        all_trig["fixed_stop"] = fv["close"] < t["entry_price"] * (1 - params["fixed_stop_pct"])
+        # 止损信号决策价 = prev_close (T-1 收盘), 不是 T 收盘 fv["close"]
+        all_trig["trailing_stop"] = prev_close < t["highest"] * (1 - params["trailing_stop_pct"])
+        all_trig["fixed_stop"] = prev_close < t["entry_price"] * (1 - params["fixed_stop_pct"])
         all_trig["time_stop"] = t["holding_days"] >= params["max_holding_days"]
         # 触发的列表
         triggered = [s for s, v in all_trig.items() if v]
         chosen = t["exit_signal"]
-        # spec 优先级链: 按 weight 降序
-        ew = weights["exit"]
-        priority_chain = sorted(ew.keys(), key=ew.get, reverse=True)
-        # 在 triggered 中, 优先级最高的就是 chosen
-        priority_pick = next((s for s in priority_chain if s in triggered), None)
-        priority_ok = (priority_pick == chosen)
-        out["exit"] = (all_trig[chosen], all_trig, fv)
-        out["priority"] = (priority_ok, triggered, priority_pick)
+        # end_of_data 是期末强制平仓, 永远算 ok, priority 验证不适用
+        if chosen == "end_of_data":
+            all_trig["end_of_data"] = True
+            out["exit"] = (True, all_trig, fv)
+            out["priority"] = (True, [], None)  # 跳过 priority 检查
+        else:
+            # spec 优先级链: 按 weight 降序
+            ew = weights["exit"]
+            priority_chain = sorted(ew.keys(), key=ew.get, reverse=True)
+            # 在 triggered 中, 优先级最高的就是 chosen
+            priority_pick = next((s for s in priority_chain if s in triggered), None)
+            priority_ok = (priority_pick == chosen)
+            out["exit"] = (all_trig.get(chosen, False), all_trig, fv)
+            out["priority"] = (priority_ok, triggered, priority_pick)
     bar = get_bar(t["code"], t["exit_date"])
     if bar is not None:
-        cs = can_sell(bar)
+        # A 股规则: T 开盘成交
+        hist = load_stock(t["code"].split(".")[0])
+        sub_signal = hist[hist["日期"] < t["exit_date"]].sort_values("日期").reset_index(drop=True)
+        prev_close = float(sub_signal.iloc[-1]["收盘价"]) if len(sub_signal) else 0.0
+        cs = can_sell_at_open(bar, prev_close, t["code"])
         out["ash_exit"] = (cs, is_limit_down(bar), is_one_word_down(bar), bar.get("涨幅%"))
     return out
 

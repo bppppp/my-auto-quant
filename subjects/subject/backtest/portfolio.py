@@ -209,9 +209,13 @@ def enforce_max_single_weight(
             for k in others:
                 out[k] *= scale
         else:
-            # 全部触顶 → 等比缩放
+            # 全部触顶 → 等比缩放到 max_pct，然后归一化到总和=1
             for k in out:
                 out[k] = max_pct
+    # 归一化：确保总和回到 1.0（避免 sum<1 导致后续 enforcer 错误放大）
+    s = sum(out.values())
+    if s > 0 and abs(s - 1.0) > 1e-6:
+        out = {k: v / s for k, v in out.items()}
     return out
 
 
@@ -242,13 +246,17 @@ def enforce_industry_concentration(
         else:
             scale[ind] = 1.0
     out: dict[str, float] = {}
+    any_scaled = False
     for code, w in weights.items():
         ind = industry_map.get(code, "unknown")
         out[code] = w * scale[ind]
-    # 重新归一化到 1
-    s = sum(out.values())
-    if s > 0 and abs(s - 1.0) > 1e-6:
-        out = {k: v / s for k, v in out.items()}
+        if scale[ind] < 1.0:
+            any_scaled = True
+    # 只有真正触发了行业超限（做了缩放）才归一化；安全情况下保持原样
+    if any_scaled:
+        s = sum(out.values())
+        if s > 0 and abs(s - 1.0) > 1e-6:
+            out = {k: v / s for k, v in out.items()}
     return out
 
 
@@ -345,7 +353,20 @@ def load_industry_map(
 
     Returns:
         {code: industry_name}.
+
+    Note:
+        如果某只股票的行业信息缺失，会在结果中缺少该条目，
+        enforce_industry_concentration 对该股票的行业约束会失效。
     """
     df = load_day(date)
     sub = df[df["代码"].isin(set(universe_codes))]
-    return dict(zip(sub["代码"], sub["所属行业"]))
+    result = dict(zip(sub["代码"], sub["所属行业"]))
+
+    # 检查是否有股票缺失行业信息
+    missing = [c for c in universe_codes if c not in result]
+    if missing:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[load_industry_map] {date}: {len(missing)}/{len(universe_codes)} 只股票缺失行业信息: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+    return result

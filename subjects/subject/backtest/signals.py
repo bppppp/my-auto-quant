@@ -49,21 +49,37 @@ def score_entry(
 def rank_top_n(
     scores: dict[T, float],
     top_n: int,
+    seed: int | None = None,
 ) -> list[T]:
     """按 score 降序取 top N (score > 0 才入选).
+
+    当 score 相同时，用随机 shuffle 做 tie-break（确保每次选出不同候选股，避免固定选某几只）。
 
     Args:
         scores: {key: score}, score 必须 >= 0.
         top_n: 选 top N, N <= 0 视为全选.
+        seed: 随机种子。None=每次选同一只（code顺序），固定seed=每次选不同但可复现。
 
     Returns:
         按 score 降序排列的 key 列表.
     """
+    import random
+
+    def sort_key(kv):
+        return (kv[1], kv[0])  # score 降序，code 升序
+
     if top_n <= 0:
-        return [k for k, v in sorted(scores.items(), key=lambda kv: kv[1], reverse=True) if v > 0]
+        return [k for k, v in sorted(scores.items(), key=sort_key, reverse=True) if v > 0]
     positives = [(k, v) for k, v in scores.items() if v > 0]
-    positives.sort(key=lambda kv: kv[1], reverse=True)
-    return [k for k, _ in positives[:top_n]]
+    positives.sort(key=sort_key, reverse=True)
+    result = [k for k, _ in positives[:top_n]]
+    # 当 score 全等（score 相同）时，用随机 shuffle 打乱
+    if seed is not None and len(result) > 1:
+        all_scores = set(v for _, v in positives[:top_n])
+        if len(all_scores) == 1:
+            random.seed(seed)
+            random.shuffle(result)
+    return result
 
 
 # ============ 出场侧 ============

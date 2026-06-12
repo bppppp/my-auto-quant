@@ -564,16 +564,18 @@ class Strategy:
 
 - **位置**：文件最顶部（第 1 行起）
 - **格式**：与 §8 调试模式注释块一致（`# key: value`）
-- **必含字段**：`strategy` / `mode` 选项 / `run` 选项（single vs monitor）/ 至少 3 个 `# command` 行
+- **必含字段**：`strategy` / `mode` 选项 / `run` 选项（single vs monitor）/ 至少 6 个 `# command` 行
 - **示例**：
 
 ```python
 # strategy: ma_cross_atr_volume
-# mode: params (默认) | weight   ← positional, 第一参数
+# mode: params (默认) | weight | top300   ← positional, 第一参数
 # run:   single (默认) | --monitor   ← single 跑一次退出 / --monitor 监听文件夹触发
 # command: python strategy.py
 # command: python strategy.py params
 # command: python strategy.py weight
+# command: python strategy.py top300
+# command: python strategy.py top300 --rounds 5 --max-retries 3
 # command: python strategy.py --monitor
 # command: python strategy.py weight --monitor
 # purpose: 策略回测执行入口 (本文件即调用自身 Strategy 类, 策略名隐含在文件路径)
@@ -590,18 +592,34 @@ from typing import Optional
 
 @dataclass
 class StrategyConfig:
-    """策略执行配置. 任何字段非 None 时, 覆盖对应 CLI 参数和 spec 默认值."""
+    """策略执行配置. 任何字段非 None 时, 覆盖对应 CLI 参数和 spec 默认值.
+
+    **两套配置分离**:
+    - params / weight 模式: test_universe / start_date / end_date / limit
+    - top300 模式: top300_start_date / top300_end_date / top300_limit (时间范围和 limit 仅在 top300 模式生效)
+    """
+    # === params / weight 模式配置 ===
     test_universe: Optional[list[str]] = None   # 自定义股票代码列表 (带后缀, 如 ["000001.SZ", "600000.SH"])
     start_date: Optional[str] = None            # "YYYY-MM-DD", None = 不限
     end_date: Optional[str] = None              # "YYYY-MM-DD", None = 不限
     limit: Optional[int] = None                 # 限制测试股票数 (test_universe 取前 N), None = 不限
 
+    # === top300 模式配置 (仅 top300 模式生效) ===
+    top300_start_date: Optional[str] = None     # top300 模式时间范围: "YYYY-MM-DD", None = 默认 5 年
+    top300_end_date: Optional[str] = None # top300 模式时间范围: "YYYY-MM-DD", None = 数据末日
+    top300_limit: Optional[int] = None        # top300 模式每轮回测的 limit, None = 不限
+
 # === 在这里配置 (None = 不覆盖) ===
 CONFIG = StrategyConfig(
-    test_universe=None,
+    # params / weight 模式
+    test_universe=None, # None 时默认从 test_universe/top300.md 读取(存在时),否则用 HS300
     start_date=None,
     end_date=None,
     limit=None,
+    # top300 模式
+    top300_start_date=None,
+    top300_end_date=None,
+    top300_limit=None,
 )
 ```
 
@@ -618,7 +636,7 @@ if eff_test_universe is not None or eff_limit is not None or CONFIG.start_date i
     print(f"[CONFIG] test_universe={...} start={...} end={...} limit={...} weight_test={...}")
 ```
 
-**CONFIG 4 字段与 runner 参数的对应**：
+**CONFIG 字段与 runner 参数的对应**：
 
 | CONFIG 字段 | 透传给 subject.cli.main | runner 接收 |
 |---|---|---|
@@ -626,6 +644,18 @@ if eff_test_universe is not None or eff_limit is not None or CONFIG.start_date i
 | `start_date` | `--start-date <YYYY-MM-DD>` | `BacktestRunner.start_date` |
 | `end_date` | `--end-date <YYYY-MM-DD>` | `BacktestRunner.end_date` |
 | `limit` | `--max-stocks <int>` | `BacktestRunner.max_stocks` |
+| `top300_start_date` | 透传给 `run_top300_optimize()` 的 `start_date` | — |
+| `top300_end_date` | 透传给 `run_top300_optimize()` 的 `end_date` | — |
+| `top300_limit` | 透传给 `runner.backtest_all_stocks_summary()` 的 `min_bars` | — |
+
+**top300 模式的测试集来源**：
+
+```
+1. test_universe/top300.md 存在 → 读取其中的股票列表
+2. test_universe/top300.md 不存在 → fallback 到 HS300
+```
+
+> **注意**：`test_universe` 配置在 top300 模式下**不生效**（top300 模式强制遍历全部 5841 只股票）。`test_universe` 仅在 params / weight 模式下生效。
 
 #### 4.11.3 末尾 `if __name__ == "__main__":` 块
 
@@ -651,13 +681,15 @@ if __name__ == "__main__":
 
     # === 2. argparse (mode positional + flags) ===
     parser = argparse.ArgumentParser(...)
-    parser.add_argument("mode", nargs="?", default="params", choices=["params", "weight"])
+    parser.add_argument("mode", nargs="?", default="params", choices=["params", "weight", "top300"])
     parser.add_argument("--monitor", action="store_true", help="watchdog 监听 strategiesParam/ 或 strategiesWeight/")
     parser.add_argument("--weight-test", default=None, help="weight 模式覆盖 test name (默认 = 策略名)")
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--capital", type=float, default=1_000_000)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--rounds", type=int, default=3, help="top300 模式: 调优轮数 (默认 3)")
+    parser.add_argument("--max-retries", type=int, default=3, help="top300 模式: LLM 重试上限 (默认 3)")
     args = parser.parse_args()
 
     # === 3. run_once() 函数: 委托给 subject.cli.main ===
@@ -686,8 +718,32 @@ if __name__ == "__main__":
             cli_args += ["--output", args.output]
         return main(cli_args)
 
+       # === 3.5. run_top300() 函数: 委托给 subject.cli.top300 ===
+    def run_top300() -> int:
+        from subject.cli.top300 import run_top300_optimize
+        # CONFIG 覆盖 (最高优先级)
+        eff_start_date = CONFIG.top300_start_date if CONFIG.top300_start_date is not None else args.start_date
+        eff_end_date = CONFIG.top300_end_date if CONFIG.top300_end_date is not None else args.end_date
+        eff_limit = CONFIG.top300_limit
+        result = run_top300_optimize(
+            name="<strategy_name>",
+            rounds=args.rounds,
+            max_retries=args.max_retries,
+            start_date=eff_start_date,
+            end_date=eff_end_date,
+            limit=eff_limit,
+        )
+        if result is None:
+            print("[ERROR] Top300 筛选失败")
+            return 1
+        print(f"[OK] Top300 测试集已写入: test_universe/top300.md")
+        print(f"      最优轮: Round {result.best_round}, 平均年化收益率: {result.best_avg_return:+.2%}")
+        return 0
+
     # === 4. single 模式: 跑一次退出 ===
     if not args.monitor:
+        if args.mode == "top300":
+            sys.exit(run_top300())
         sys.exit(run_once())
 
     # === 5. --monitor 模式: 用 watchdog 监听目录 (见 §4.11.4) ===
@@ -702,6 +758,9 @@ if __name__ == "__main__":
 |---|---|---|
 | `python strategy.py --monitor` (params) | `strategiesParam/` | `.+_v\d+\.md$` |
 | `python strategy.py weight --monitor` (weight) | `strategiesWeight/` | `.+_weight_v\d+\.md$` |
+| `python strategy.py top300` (top300) | **不支持 monitor模式** | — |
+
+> **注意**：`top300` 模式不支持 `--monitor`（因为三轮回测耗时较长，需要单独执行）。
 
 **实现关键点**：
 

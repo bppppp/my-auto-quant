@@ -7,9 +7,13 @@ ATR = period 日 TR 的算术平均.
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from ._cache import try_get_cached_factor
+
+logger = logging.getLogger(__name__)
 
 
 def atr(
@@ -29,6 +33,7 @@ def atr(
     Returns:
         Series: 长度与 close 一致; 前 ``period`` 行为 NaN
             (position 0 上 prev_close 是 NaN, 该日 TR 即 NaN).
+        如果数据不足 period 行，返回全 NaN Series。
 
     Note:
         使用 ``np.maximum.reduce`` (NaN-propagating) 而非 ``pd.concat.max``
@@ -36,11 +41,23 @@ def atr(
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
-    # 预计算 cache 命中: 直接返回预计算的 Series
+
+    series_len = len(close)
+
+    # 1. 预计算 cache 命中: 直接返回预计算的 Series
     # 注: pre-compute 仅有 atr_14. 其他 period 调用走运行时.
-    cached = try_get_cached_factor("atr_14", length=len(close))
+    cached = try_get_cached_factor("atr_14", length=series_len)
     if cached is not None:
         return cached
+
+    # 2. 数据不足 period+1 行（需要 period 行 TR + 1 行 prev_close）
+    if series_len < period + 1:
+        logger.debug(
+            f"[atr] atr_{period}: 数据不足 ({series_len} < {period + 1}), 返回全 NaN"
+        )
+        return pd.Series([float("nan")] * series_len, index=close.index)
+
+    # 3. 数据充足，正常计算
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()

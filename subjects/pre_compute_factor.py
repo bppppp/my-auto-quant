@@ -36,6 +36,7 @@ FACTOR_COLUMNS = [
     ("ma_10", lambda df: ma(df["收盘价"], 10)),
     ("ma_20", lambda df: ma(df["收盘价"], 20)),
     ("ma_30", lambda df: ma(df["收盘价"], 30)),
+    ("ma_50", lambda df: ma(df["收盘价"], 50)),  # 新增: trend_breakout_atr_rsi 策略需要
     ("ma_60", lambda df: ma(df["收盘价"], 60)),
     ("atr_14", lambda df: atr(df["最高价"], df["最低价"], df["收盘价"], 14)),
     ("rsi_14", lambda df: rsi(df["收盘价"], 14)),

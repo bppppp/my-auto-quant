@@ -1,11 +1,13 @@
 """A 股交易规则. 见 subject.md §4.
 
 涵盖:
-- T+1 交割 (check_T_plus_1)
 - 涨跌停限制 (主板 ±10% / 创科 ±20% / ST ±5%)
 - 板块判定 (get_board, get_limit_pct)
 - 一字板判定 (is_one_word_board)
-- 流动性判定 (can_buy / can_sell)
+- 流动性判定 (can_buy / can_sell / can_buy_at_open / can_sell_at_open)
+
+注: 循环结构隐式保证 T+1 (先 sell 后 buy 在下个 Bar 才可能发生),
+本模块不提供显式 T+1 检查函数.
 """
 from __future__ import annotations
 
@@ -108,18 +110,6 @@ def is_one_word_down(row: pd.Series) -> bool:
     return is_limit_down(row)
 
 
-def check_T_plus_1(holding_today: bool) -> bool:
-    """T+1 判定: 当日买入的股票次日才能卖.
-
-    Args:
-        holding_today: 该股票今日已买入 (True 表示今日新增持仓, 不可卖).
-
-    Returns:
-        True 表示可以卖 (持有 ≥ 1 日); False 表示 T+1 限制下不可卖.
-    """
-    return not holding_today
-
-
 def can_buy(row: pd.Series) -> bool:
     """综合判定: 当日能否买入.
 
@@ -151,5 +141,43 @@ def can_sell(row: pd.Series) -> bool:
     if is_limit_down(row):
         return False
     if is_one_word_down(row):
+        return False
+    return True
+
+
+def can_buy_at_open(bar: pd.Series, prev_close: float, code: str, epsilon: float = 0.01) -> bool:
+    """开盘价能否成交 (T 日开盘, 以 T-1 收盘价为基准).
+
+    用于"信号基于 T-1 因子 + T 开盘执行"模式: 避免开盘一字板买不到.
+
+    限制:
+    - ST → 不能买入
+    - 开盘价 > T-1 收盘价 × (1 + 涨停幅度) - epsilon → 一字涨停开盘, 买不到
+      (用 > 不用 >=: epsilon 仅用于浮点容差, 等于边界值应放行而非 block)
+    """
+    if bool(bar.get("是否ST", False)):
+        return False
+    open_px = float(bar["开盘价"])
+    is_st = bool(bar.get("是否ST", False))
+    limit_pct = get_limit_pct(code, is_st)
+    limit_up_px = prev_close * (1.0 + limit_pct)
+    if open_px > limit_up_px - epsilon:
+        return False
+    return True
+
+
+def can_sell_at_open(bar: pd.Series, prev_close: float, code: str, epsilon: float = 0.01) -> bool:
+    """开盘价能否成交 (T 日开盘, 以 T-1 收盘价为基准).
+
+    用于"信号基于 T-1 因子 + T 开盘执行"模式: 避免开盘一字跌停卖不掉.
+
+    限制:
+    - 开盘价 < T-1 收盘价 × (1 - 跌停幅度) + epsilon → 一字跌停开盘, 卖不掉
+    """
+    open_px = float(bar["开盘价"])
+    is_st = bool(bar.get("是否ST", False))
+    limit_pct = get_limit_pct(code, is_st)
+    limit_down_px = prev_close * (1.0 - limit_pct)
+    if open_px < limit_down_px + epsilon:
         return False
     return True

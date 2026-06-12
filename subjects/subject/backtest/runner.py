@@ -25,13 +25,14 @@ from typing import Any, Literal
 
 import pandas as pd
 
-from .a_share_rules import can_buy, can_sell
+from .a_share_rules import can_buy, can_buy_at_open, can_sell, can_sell_at_open
 from .data_loader import load_day, load_stock
 from .fees import calc_buy_fee, calc_sell_fee
 from .log_utils import setup_backtest_logger
 from .metrics import compute_metrics
 from subject.factors._cache import (  # 预计算因子 cache
-    bind_current_code, bind_factor_cache, reset_current_code,
+    bind_current_code, bind_current_date, bind_factor_cache,
+    reset_current_code, reset_current_date,
 )
 from subject.backtest.data_loader.by_stock_factor import (  # 预计算因子 loader
     try_load_stock_factor,
@@ -56,6 +57,33 @@ MODE_DATA_SOURCE: dict[str, str] = {
     "params": "data-by-stock",
     "weight": "data-by-day",
 }
+
+
+
+def _to_float(value: Any) -> float:
+    """安全转 float，处理复数等异常情况."""
+    if isinstance(value, complex):
+        # 复数取实部
+        value = value.real
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+@dataclass
+class StockBacktestSummary:
+    """单只股票回测汇总结果（用于 top300 筛选）."""
+
+    code: str # 股票代码，含交易所后缀
+    name: str           # 股票名称
+    annual_return: float  # 年化收益率
+    total_return: float   # 总收益率 (final / initial - 1)
+    total_pnl: float      # 总盈亏（元）
+    win_rate: float        # 胜率
+    num_trades: int # 交易次数
+    max_drawdown: float # 最大回撤
+    holding_days_avg: float  # 平均持仓天数
 
 
 @dataclass
@@ -156,6 +184,58 @@ class BacktestRunner:
         if self.max_stocks is not None:
             self.logger.info(f"max_stocks (limit): {self.max_stocks}")
         self.logger.info(f"actual universe size: {len(self.universe)}")
+
+    # ===== 热启动天数计算 =====
+    _warmup_days: int | None = None  # 类属性缓存，避免重复计算
+
+    def _get_warmup_days(self) -> int:
+        """动态计算策略需要的热启动天数。
+
+        通过解析 strategy.py 源代码，提取因子函数调用的最大周期。
+        确保加载足够的历史数据，使所有因子在测试期开始时就能产生有效值。
+
+        返回:
+            热启动天数 = max(因子周期) + 20 天 buffer
+        """
+        # 缓存：只计算一次
+        if BacktestRunner._warmup_days is not None:
+            return BacktestRunner._warmup_days
+
+        import re
+
+        strategy_path = self.subjects_dir / self.strategy_name / "generated" / "strategy.py"
+        if not strategy_path.exists():
+            BacktestRunner._warmup_days = 70
+            return 70
+
+        try:
+            code = strategy_path.read_text(encoding="utf-8")
+        except Exception:
+            BacktestRunner._warmup_days = 70
+            return 70
+
+        max_period = 0
+        # 匹配 ma(..., N), atr(..., N), rsi(..., N), volume_ratio(..., N), mom(..., N)
+        patterns = [
+            r'\bma\s*\([^)]+,\s*(\d+)\)',
+            r'\batr\s*\([^)]+,\s*(\d+)\)',
+            r'\brsi\s*\([^)]+,\s*(\d+)\)',
+            r'\bvolume_ratio\s*\([^)]+,\s*(\d+)\)',
+            r'\bmom\s*\([^)]+,\s*(\d+)\)',
+            r'\bdonchian_high\s*\([^)]+,\s*(\d+)\)',
+            r'\bdonchian_low\s*\([^)]+,\s*(\d+)\)',
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, code):
+                period = int(match.group(1))
+                max_period = max(max_period, period)
+
+        # 至少 20 天 buffer，确保因子稳定
+        warmup_days = max(max_period + 20, 70)
+        BacktestRunner._warmup_days = warmup_days
+        self.logger.info(f"[warmup] 策略最大因子周期: {max_period} 天, 热启动: {warmup_days} 天")
+        return warmup_days
 
     # ===== 加载 =====
     def _load_spec(self) -> dict:
@@ -347,12 +427,25 @@ class BacktestRunner:
                 # === 预计算公共因子 bind (包住整只股的回测) ===
                 code6 = code.split(".")[0]
                 factor_df = try_load_stock_factor(code6)
+                # 关键: factor_df 必须按 df 的日期范围过滤 + 排序 + reset_index,
+                # 否则 try_get_cached_factor 的 iloc[:length] 位置切片会取到
+                # 错误日期的因子值 (factor_df 是完整历史数据, df 已被 start/end 过滤).
+                if factor_df is not None:
+                    min_date = df["日期"].min()
+                    max_date = df["日期"].max()
+                    factor_df = factor_df[
+                        (factor_df["日期"] >= min_date) & (factor_df["日期"] <= max_date)
+                    ]
+                    factor_df = factor_df.sort_values("日期").reset_index(drop=True)
                 bind_factor_cache(code6, factor_df)
                 token = bind_current_code(code6)
                 try:
                     res = self._backtest_single_stock(df, code)
                 finally:
                     reset_current_code(token)
+                    # 清理因子缓存，防止跨股票泄漏
+                    from subject.factors._cache import reset_factor_cache
+                    reset_factor_cache()
             except Exception as e:
                 self.logger.error(f"[{i}/{total_stocks}] {code} - backtest failed: {e}", exc_info=True)
                 continue
@@ -416,13 +509,260 @@ class BacktestRunner:
 
         return self._build_results(all_trades, all_events, factor_values, dv_series, version=version)
 
+    # ===== Top300 筛选专用方法 =====
+
+    @staticmethod
+    def get_all_stock_codes() -> list[str]:
+        """获取 data-by-stock/ 下全部股票代码列表（含交易所后缀）.
+
+        Returns:
+            股票代码列表，如 ["000001.SZ", "000002.SZ", ...]
+        """
+        from .data_loader import DATA_ROOT
+        stock_dir = DATA_ROOT / "data-by-stock"
+        if not stock_dir.exists():
+            return []
+        codes = []
+        for f in stock_dir.iterdir():
+            if f.suffix == ".csv" and "_金玥数据" in f.name:
+                # 文件名格式: XXXXXX_金玥数据.csv
+                code6 = f.stem.split("_")[0]
+                # 根据代码前缀判断交易所
+                if code6.startswith("6"):
+                    exchange = "SH"
+                elif code6.startswith(("0", "3")):
+                    exchange = "SZ"
+                elif code6.startswith("8") or code6.startswith("4"):
+                    exchange = "BJ"
+                else:
+                    exchange = "SZ"
+                codes.append(f"{code6}.{exchange}")
+        return sorted(codes)
+
+    def backtest_all_stocks_summary(
+        self,
+        all_codes: list[str] | None = None,
+        min_bars: int | None = None,
+    ) -> list[StockBacktestSummary]:
+        """遍历全部股票，返回每只的年化收益率汇总（用于 top300 筛选）.
+
+        Args:
+            all_codes: 股票代码列表，默认使用全部股票
+            min_bars: 最小 K 线数，默认使用 self.min_bars
+
+        Returns:
+            StockBacktestSummary 列表，按 annual_return 降序排列
+        """
+        import math
+
+        if all_codes is None:
+            all_codes = self.get_all_stock_codes()
+        if min_bars is None:
+            min_bars = self.min_bars
+
+        results: list[StockBacktestSummary] = []
+        total = len(all_codes)
+        self.logger.info(f"=== top300 scan: processing {total} stocks ===")
+        skipped_data_missing = 0
+        skipped_too_few = 0
+        t_start = datetime.now()
+
+        #进度日志: 每 5% 汇总一次
+        log_every_n = max(1, total // 20)
+        next_log_at = log_every_n
+
+        for i, code in enumerate(all_codes, 1):
+            code6 = code.split(".")[0]
+
+            try:
+                df = load_stock(code6)
+            except FileNotFoundError:
+                self.logger.warning(f"[{i}/{total}] {code} - data not found")
+                skipped_data_missing += 1
+                continue
+
+            # 退市过滤：从全量数据检查（直接用已加载的 df）
+            if "退市时间" in df.columns and df["退市时间"].notna().any():
+                delist_df = df.dropna(subset=["退市时间"])
+                if len(delist_df) > 0:
+                    last_row = delist_df.iloc[-1]
+                    delist_date = last_row["退市时间"]
+                    test_end_date = df["日期"].max()
+                    if pd.notna(delist_date) and delist_date <= test_end_date:
+                        # 该股票已退市，跳过
+                        skipped_too_few += 1
+                        continue
+
+            # 获取股票名称（从已加载数据中获取，无需重新加载）
+            name = ""
+            if "名称" in df.columns and len(df) > 0:
+                name = df["名称"].iloc[0]
+
+            # 日期过滤
+            if self.start_date:
+                df = df[df["日期"] >= pd.Timestamp(self.start_date)]
+            if self.end_date:
+                df = df[df["日期"] <= pd.Timestamp(self.end_date)]
+            df = df.sort_values("日期").reset_index(drop=True)
+            if len(df) < min_bars:
+                skipped_too_few += 1
+                continue
+
+            try:
+                factor_df = try_load_stock_factor(code6)
+                if factor_df is not None:
+                    min_date = df["日期"].min()
+                    max_date = df["日期"].max()
+                    factor_df = factor_df[
+                        (factor_df["日期"] >= min_date) & (factor_df["日期"] <= max_date)
+                    ]
+                    factor_df = factor_df.sort_values("日期").reset_index(drop=True)
+                bind_factor_cache(code6, factor_df)
+                token = bind_current_code(code6)
+                try:
+                    res = self._backtest_single_stock(df, code)
+                finally:
+                    reset_current_code(token)
+                    # 清理因子缓存，防止跨股票泄漏
+                    from subject.factors._cache import reset_factor_cache
+                    reset_factor_cache()
+            except Exception as e:
+                self.logger.error(f"[{i}/{total}] {code} - backtest failed: {e}")
+                continue
+
+            # 计算该股的年化收益率
+            per_stock_capital = self.initial_capital * self.params.get("max_single_weight", 0.10)
+            trades = res["trades"]
+            daily_values = res["daily_values"]
+
+            if daily_values:
+                dates, vals = zip(*daily_values)
+                dv_series = pd.Series(vals, index=pd.DatetimeIndex(dates))
+                initial = per_stock_capital
+                final = float(dv_series.iloc[-1])
+                n_days = (dv_series.index[-1] - dv_series.index[0]).days
+                n_days = max(n_days, 1)
+                annual_return = (final / initial) ** (365.0 / n_days) - 1.0
+                total_return = (final / initial) - 1.0
+            else:
+                annual_return = 0.0
+                total_return = 0.0
+
+            # 计算 PnL、胜率等
+            total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+            pnls = [t.get("pnl", 0) or 0 for t in trades]
+            n_wins = sum(1 for p in pnls if p > 0)
+            win_rate = n_wins / len(pnls) if pnls else 0.0
+
+            # 平均持仓天数
+            holding_days = [t.get("holding_days", 0) or 0 for t in trades]
+            holding_days_avg = sum(holding_days) / len(holding_days) if holding_days else 0.0
+
+            # 最大回撤（从 daily_values 计算）
+            max_drawdown = 0.0
+            if daily_values:
+                dates, vals = zip(*daily_values)
+                dv_series = pd.Series(vals, index=pd.DatetimeIndex(dates))
+                peaks = dv_series.cummax()
+                drawdowns = (dv_series - peaks) / peaks
+                max_drawdown = float(drawdowns.min())
+
+            results.append(StockBacktestSummary(
+                code=code,
+                name=name,
+                annual_return=_to_float(annual_return),
+                total_return=_to_float(total_return),
+                total_pnl=float(total_pnl),
+                win_rate=float(win_rate),
+                num_trades=len(trades),
+                max_drawdown=float(max_drawdown),
+                holding_days_avg=float(holding_days_avg),
+            ))
+
+            # 5% 汇总日志
+            if i >= next_log_at or i == total:
+                pct = i / total * 100
+                self.logger.info(f"[stock {i}/{total}] {pct:.0f}% done | results={len(results)}")
+                while next_log_at <= i:
+                    next_log_at += log_every_n
+
+        # 按年化收益率降序排列
+        results.sort(key=lambda x: x.annual_return, reverse=True)
+
+        # 检查有效结果是否少于 300 只
+        total_skipped = skipped_data_missing + skipped_too_few
+        if len(results) < 300:
+            self.logger.warning(
+                f"[top300] ⚠️ 有效股票仅 {len(results)} 只 (< 300), "
+                f"可能原因: 数据缺失({skipped_data_missing}) / 退市({skipped_too_few}) / 时间范围"
+            )
+
+        wall_time = datetime.now() - t_start
+        self.logger.info(f"=== top300 scan complete ===")
+        self.logger.info(f"total stocks: {total}, processed: {len(results)}, skipped: {skipped_data_missing + skipped_too_few}")
+        self.logger.info(f"wall time: {wall_time}")
+
+        # 打印缓存统计
+        from .data_loader.by_stock import get_cache_stats
+        from .data_loader.by_stock_factor import get_factor_cache_stats
+        stock_hits, stock_misses = get_cache_stats()
+        factor_hits, factor_misses = get_factor_cache_stats()
+        total_requests = stock_hits + stock_misses
+        if total_requests > 0:
+            stock_hit_rate = stock_hits / total_requests * 100
+            self.logger.info(f"📦 数据缓存: hits={stock_hits}, misses={stock_misses}, hit_rate={stock_hit_rate:.1f}%")
+        total_factor_requests = factor_hits + factor_misses
+        if total_factor_requests > 0:
+            factor_hit_rate = factor_hits / total_factor_requests * 100
+            self.logger.info(f"📦 因子缓存: hits={factor_hits}, misses={factor_misses}, hit_rate={factor_hit_rate:.1f}%")
+
+        return results
+
     def _backtest_single_stock(self, df: pd.DataFrame, code: str) -> dict:
         """单只股票时间序列回测.
 
+        **执行时序 (T-1 因子 + T 开盘交易)**
+        1. 跳过 Bar[0] (无 T-1 数据, 不能交易)
+        2. compute_factors(df.iloc[:i]) → 用 T-1 及之前数据
+        3. should_exit / entry_score 用 T-1 因子决策
+        4. 用 bar[i].open 成交 (而非 close, 避免 look-ahead)
+        5. 收盘时更新 highest / holding_days, 记录 daily_value
+        6. 期末 (Bar[-1]) 强制平仓
+
         资金视角: 每只股票从 ``per_stock_capital`` 开始, 累计已实现 PnL 持续累加.
-        无持仓时 value = per_stock_capital + cumulative_pnl (相当于全部变现为现金).
+        无持仓时 value = per_stock_capital + cumulative_pnl.
         有持仓时 value = per_stock_capital + cumulative_pnl + (close - entry) * shares.
         """
+        # === 热启动: 为因子计算加载足够的 lookback 数据 ===
+        # 动态计算策略需要的最大因子窗口，避免硬编码
+        warmup_days = self._get_warmup_days()
+        if self.start_date is not None and len(df) > 0:
+            test_start = pd.Timestamp(self.start_date)
+            warmup_start = test_start - pd.Timedelta(days=warmup_days)
+            # 重新从完整历史加载, 取 warmup_start之后的全部数据
+            try:
+                full_df = load_stock(code.split(".")[0])
+                warmup_df = full_df[full_df["日期"] >= warmup_start]
+                if len(warmup_df) >= warmup_days:
+                    df = warmup_df.sort_values("日期").reset_index(drop=True)
+                    # === 修复: warmup 后重新绑定因子缓存 ===
+                    # 否则 factor cache 长度(不含 warmup) 与 df长度(含 warmup) 不匹配,
+                    # 导致 try_get_cached_factor 每次都 miss 并打印 warning.
+                    code6 = code.split(".")[0]
+                    factor_df = try_load_stock_factor(code6)
+                    if factor_df is not None:
+                        factor_min_date = df["日期"].min()
+                        factor_max_date = df["日期"].max()
+                        factor_df = factor_df[
+                            (factor_df["日期"] >= factor_min_date) &
+                            (factor_df["日期"] <= factor_max_date)
+                        ]
+                        factor_df = factor_df.sort_values("日期").reset_index(drop=True)
+                    bind_factor_cache(code6, factor_df)
+            except Exception:
+                # 回退到原始 df (数据不够长)
+                pass
+
         trades: list[dict] = []
         events: list[dict] = []
         factor_values: dict[str, list[float]] = {}
@@ -430,44 +770,66 @@ class BacktestRunner:
         pos: Position | None = None
         per_stock_capital = self.initial_capital * self.params.get("max_single_weight", 0.10)
         cumulative_pnl: float = 0.0  # 累计已实现 PnL
+        prev_close: float | None = None  # T-1 收盘价 (供 T 日开盘执行/limit 判断用)
 
         for i in range(len(df)):
             bar = df.iloc[i]
             date: pd.Timestamp = bar["日期"]
+            open_px: float = float(bar["开盘价"])
             close: float = float(bar["收盘价"])
 
-            # 1. compute_factors
+            # 1. 跳过 Bar[0] (无 T-1 数据), 只记录初始 value
+            if i == 0:
+                daily_values.append((date, per_stock_capital))
+                prev_close = close
+                continue
+
+            # 2. compute_factors (用 T-1 数据, 即 df.iloc[:i], 不含今天的 Bar[i])
+            #    设置 T-1 日期用于因子缓存的日期精确匹配 (v2 修复)
+            t1_date = df.iloc[i - 1]["日期"]
+            date_token = bind_current_date(t1_date)
             try:
-                factors = self.strategy.compute_factors(df.iloc[: i + 1], self.params)
+                factors = self.strategy.compute_factors(df.iloc[:i], self.params)
             except Exception as e:
+                reset_current_date(date_token)
                 events.append({"code": code, "signal": "compute_factors", "action": "skipped", "error": str(e), "pnl": None, "holding_days": None})
+                # 因子计算失败, 仍记录 daily_value (维持仓位估值)
+                if pos is not None:
+                    unrealized = (close - pos.entry_price) * pos.shares
+                    value = per_stock_capital + cumulative_pnl + unrealized
+                else:
+                    value = per_stock_capital + cumulative_pnl
+                daily_values.append((date, value))
+                pos.highest = max(pos.highest, close) if pos is not None else None
+                if pos is not None:
+                    pos.holding_days = (date - pos.entry_date).days
+                prev_close = close
                 continue
             for k, v in factors.items():
                 if isinstance(v, pd.Series) and len(v) > 0 and not pd.isna(v.iloc[-1]):
                     factor_values.setdefault(k, []).append(float(v.iloc[-1]))
+            reset_current_date(date_token)  # v2 修复: 因子计算完成后 reset 日期
 
-            # 2. 检查出场
+            # 3. 检查出场 → at bar[i].open 成交
             if pos is not None:
-                pos.highest = max(pos.highest, close)
-                pos.holding_days = (date - pos.entry_date).days
+                # pos_dict 用 prev_close (T-1 收盘) 作为 "当前价格"
+                # - 决策时点: T-1 收盘后, 还没到 T 开盘
+                # - 所以策略看到的 "当前价" 应该是 T-1 收盘价
                 pos_dict = pos.to_state_dict()
-                pos_dict["current_price"] = close
-                pos_dict["pnl_pct"] = (close - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+                pos_dict["current_price"] = prev_close
+                pos_dict["pnl_pct"] = (prev_close - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
                 try:
                     exit_sig = self.strategy.should_exit(pos_dict, factors, self.params, self.weights)
                 except Exception:
                     exit_sig = None
                 if exit_sig:
-                    if can_sell(bar):
-                        # PnL 需扣 sell_fee (印花税 0.1% + 佣金 0.025% + 沪市过户 0.001%)
-                        # entry_price 已是含费均价, 故 (close - entry_price) * shares 是毛利,
-                        # 实际净 PnL = 毛利 - sell_fee
-                        sell_amount = close * pos.shares
-                        pnl = (close - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
+                    if can_sell_at_open(bar, prev_close, code):
+                        # PnL 用 open 价 (T 开盘成交)
+                        sell_amount = open_px * pos.shares
+                        pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
                         cumulative_pnl += pnl
                         trades.append({"code": code, "pnl": pnl, "holding_days": pos.holding_days, "signal": exit_sig})
                         events.append({"code": code, "signal": exit_sig, "action": "executed", "pnl": pnl, "holding_days": pos.holding_days})
-                        # 将 exit 的 pnl/holding_days 关联到触发入场的 entry 信号
                         if pos.entry_signals:
                             for sig_name in pos.entry_signals:
                                 events.append({"code": code, "signal": sig_name, "action": "exit_linked", "pnl": pnl, "holding_days": pos.holding_days})
@@ -475,39 +837,55 @@ class BacktestRunner:
                     else:
                         events.append({"code": code, "signal": exit_sig, "action": "swallowed", "pnl": None, "holding_days": pos.holding_days})
 
-            # 3. 检查入场 (无持仓时)
+            # 4. 检查入场 → at bar[i].open 成交
             if pos is None:
                 try:
                     score = self.strategy.entry_score(factors, self.params, self.weights)
                 except Exception:
                     score = 0
-                if score > 0 and can_buy(bar):
+                if score > 0 and can_buy_at_open(bar, prev_close, code):
                     amount = per_stock_capital
-                    shares = int(amount / close / 100) * 100
+                    shares = int(amount / open_px / 100) * 100
                     if shares > 0:
-                        fee = calc_buy_fee(shares * close, code)
-                        effective_entry = (shares * close + fee) / shares
-                        # 调用策略的 get_triggered_signals 方法获取触发入场的信号列表
+                        fee = calc_buy_fee(shares * open_px, code)
+                        effective_entry = (shares * open_px + fee) / shares
                         triggered_signals = self.strategy.get_triggered_signals(factors, self.params, self.weights)
                         pos = Position(
                             code=code, shares=shares,
                             entry_price=effective_entry, entry_date=date,
-                            highest=close, holding_days=0,
+                            highest=open_px, holding_days=0,
                             entry_signals=triggered_signals,
                         )
-                        # 记录 entry_combined 事件（用于统计有信号触发的次数）
                         events.append({"code": code, "signal": "entry_combined", "action": "executed", "pnl": None, "holding_days": 0})
-                        # 同时为每个具体 entry 信号记录事件（用于 Signal Stats 报告）
                         for sig_name in triggered_signals:
                             events.append({"code": code, "signal": sig_name, "action": "triggered", "pnl": None, "holding_days": 0})
 
-            # 4. 记录 daily value
+            # 5. 收盘更新 highest / holding_days + 记录 daily value
             if pos is not None:
+                pos.highest = max(pos.highest, close)
+                pos.holding_days = (date - pos.entry_date).days
                 unrealized = (close - pos.entry_price) * pos.shares
                 value = per_stock_capital + cumulative_pnl + unrealized
             else:
                 value = per_stock_capital + cumulative_pnl
             daily_values.append((date, value))
+            prev_close = close
+
+        # 6. 期末强制平仓 (防止 Bar[-1] 触发出场但无法 T+1 开盘成交的"挂单"被丢弃)
+        # 用 Bar[-1].close 估算当日价值后清仓
+        if pos is not None:
+            last_bar = df.iloc[-1]
+            last_close = float(last_bar["收盘价"])
+            last_date = last_bar["日期"]
+            # 期末 PnL 用 last_close 结算
+            pnl = (last_close - pos.entry_price) * pos.shares - calc_sell_fee(last_close * pos.shares, code)
+            cumulative_pnl += pnl
+            trades.append({"code": code, "pnl": pnl, "holding_days": pos.holding_days, "signal": "end_of_data"})
+            events.append({"code": code, "signal": "end_of_data", "action": "executed", "pnl": pnl, "holding_days": pos.holding_days})
+            if pos.entry_signals:
+                for sig_name in pos.entry_signals:
+                    events.append({"code": code, "signal": sig_name, "action": "exit_linked", "pnl": pnl, "holding_days": pos.holding_days})
+            pos = None
 
         return {"trades": trades, "events": events, "factors": factor_values, "daily_values": daily_values}
 
@@ -571,10 +949,20 @@ class BacktestRunner:
         )
 
         # === 预计算公共因子 preload (与 stock_history 并行加载, 缺则不存) ===
+        # 关键: factor_df 必须按 stock_history[code] 的日期范围过滤 + 排序 + reset_index,
+        # 否则 try_get_cached_factor 的 iloc[:length] 位置切片会取到错误日期的因子值
+        # (stock_history 已带 buffer 过滤日期, factor_df 是完整历史数据).
         stock_factor_history: dict[str, pd.DataFrame] = {}
         for code in stock_history:
             factor_df = try_load_stock_factor(code.split(".")[0])
             if factor_df is not None:
+                hist = stock_history[code]
+                min_date = hist["日期"].min()
+                max_date = hist["日期"].max()
+                factor_df = factor_df[
+                    (factor_df["日期"] >= min_date) & (factor_df["日期"] <= max_date)
+                ]
+                factor_df = factor_df.sort_values("日期").reset_index(drop=True)
                 stock_factor_history[code.split(".")[0]] = factor_df
         self.logger.info(
             f"preloaded factors for {len(stock_factor_history)}/{len(stock_history)} stocks"
@@ -623,36 +1011,61 @@ class BacktestRunner:
                 n_skipped_days += 1
                 continue
             day_data: dict[str, pd.Series] = {row["代码"]: row for _, row in df.iterrows()}
+            prices: dict[str, float] = {code: float(r["收盘价"]) for code, r in day_data.items()}
+
+            # === T-1 因子模型: Bar[0] (bar_idx=1) 无 T-1 数据, 跳过所有交易, 只记录初始 value ===
+            if bar_idx == 1:
+                tv = portfolio.total_value(prices)
+                all_daily_values.append((date, tv))
+                if bar_idx == 1 or bar_idx % log_every_n_days == 0 or bar_idx == total_days:
+                    stage_return = (tv / self.initial_capital) - 1.0
+                    self.logger.info(
+                        f"[day {bar_idx}/{total_days}] {date_str} | "
+                        f"阶段收益率={stage_return:+.2%} | "
+                        f"总市值={tv:,.0f} | "
+                        f"持仓数=0 | 已调仓次数=0 (day 0: 初始化, 无 T-1 数据)"
+                    )
+                continue
 
             # 2. 算因子 + entry score
-            # 关键: compute_factors 需要多日历史, 传当日 1 行 → 全部 NaN.
-            # 解决: 用预加载的 stock_history, 取 "到今日为止" 的累计历史传给 compute_factors.
+            # 关键: 用 T-1 数据 (hist.iloc[:idx_today], 不含今天), 决策基于 T-1 收盘后的视角.
             scores: dict[str, float] = {}
             factors_by_code: dict[str, dict] = {}
+            prev_close_by_code: dict[str, float] = {}  # T-1 收盘价 (供 T 日开盘成交/limit 判断用)
             for code, row in day_data.items():
                 if code not in stock_history:
                     continue
                 hist = stock_history[code]
-                # 找 hist 中 date <= today 的最大索引 (即 "到今日为止" 的累计)
-                # 累计数据要含今日 → iloc[:i+1]
+                # 找 hist 中 date <= today (T) 的最大索引
                 mask = hist["日期"] <= date
                 if not mask.any():
                     continue
-                idx = hist.index[mask][-1]  # 最后一个 <= today 的位置
+                idx_today = hist.index[mask][-1]  # 最后一个 <= today 的位置
+                if idx_today == 0:
+                    # T 是 hist 中的第 1 行, 没有 T-1 数据, 跳过
+                    continue
+                hist_t1 = hist.iloc[:idx_today]  # T-1 及之前的历史
+                # T-1 收盘价 (用于 can_buy_at_open / can_sell_at_open 和 pos_dict.current_price)
+                prev_close_by_code[code] = float(hist_t1["收盘价"].iloc[-1])
                 # === 预计算公共因子 bind ===
                 code6 = code.split(".")[0]
                 factor_df = stock_factor_history.get(code6)
                 bind_factor_cache(code6, factor_df)
                 token = bind_current_code(code6)
+                # === v2 修复: 设置 T-1 日期用于因子缓存的日期精确匹配 ===
+                t1_date = hist_t1["日期"].iloc[-1]
+                date_token = bind_current_date(t1_date)
                 try:
-                    factors = self.strategy.compute_factors(hist.iloc[: idx + 1], self.params)
+                    factors = self.strategy.compute_factors(hist_t1, self.params)
                 except Exception as e:
+                    reset_current_date(date_token)
                     reset_current_code(token)
                     all_events.append({
                         "code": code, "signal": "compute", "action": "skipped",
                         "error": str(e), "pnl": None, "holding_days": None,
                     })
                     continue
+                reset_current_date(date_token)  # v2 修复
                 reset_current_code(token)
                 factors_by_code[code] = factors
                 for k, v in factors.items():
@@ -678,34 +1091,33 @@ class BacktestRunner:
                             "score": sig_weight, "pnl": None, "holding_days": None,
                         })
 
-            prices: dict[str, float] = {code: float(r["收盘价"]) for code, r in day_data.items()}
-
-            # 3. 检查出场
+            # 3. 检查出场 (用 T-1 因子决策, at bar[i].open 成交)
+            # 重要: 先检查 exit，再用 update_after_bar 更新 highest（与 params 模式一致）
             for code in list(portfolio.positions.keys()):
                 if code not in day_data:
                     continue
+                if code not in factors_by_code or code not in prev_close_by_code:
+                    continue
                 pos = portfolio.positions[code]
                 bar_series = day_data[code]
+                open_px = float(bar_series["开盘价"])
                 close = float(bar_series["收盘价"])
-                portfolio.update_after_bar(code, close)
+                prev_close = prev_close_by_code[code]
 
-                if code not in factors_by_code:
-                    continue
                 factors = factors_by_code[code]
                 pos_dict = pos.to_state_dict()
-                pos_dict["current_price"] = close
-                pos_dict["pnl_pct"] = (close - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+                pos_dict["current_price"] = prev_close  # 决策时看到的"当前价" = T-1 收盘
+                pos_dict["pnl_pct"] = (prev_close - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
                 try:
                     exit_sig = self.strategy.should_exit(pos_dict, factors, self.params, self.weights)
                 except Exception:
                     exit_sig = None
                 if exit_sig:
-                    if can_sell(bar_series):
-                        # PnL 需扣 sell_fee (见 calc_sell_fee). portfolio.sell 内部已扣 fee 加到 cash,
-                        # 但这里 runner 自己算的 pnl 是给 trade/event 用的, 必须独立扣一次.
-                        sell_amount = close * pos.shares
-                        pnl = (close - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
-                        _, sold_pos = portfolio.sell(code, close, date)
+                    if can_sell_at_open(bar_series, prev_close, code):
+                        # PnL 需扣 sell_fee. 用 open 价 (T 开盘成交).
+                        sell_amount = open_px * pos.shares
+                        pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
+                        _, sold_pos = portfolio.sell(code, open_px, date)
                         all_trades.append({
                             "code": code, "pnl": pnl,
                             "holding_days": pos.holding_days, "signal": exit_sig,
@@ -727,9 +1139,15 @@ class BacktestRunner:
                             "pnl": None, "holding_days": pos.holding_days,
                         })
 
+            # 收盘后更新所有剩余持仓的 highest 和 holding_days（exit 检查之后，与 params 模式一致）
+            for code in list(portfolio.positions.keys()):
+                if code in day_data:
+                    close = float(day_data[code]["收盘价"])
+                    portfolio.update_after_bar(code, close)
+
             # 4. 调仓日
             if should_rebalance_fn(bar_idx, freq):
-                top_codes = rank_top_n(scores, target_n)
+                top_codes = rank_top_n(scores, target_n, seed=42)
                 if top_codes:
                     n_rebalances += 1
                     # 不再打印 top N 列表, 阶段收益会在 5% 进度日志统一输出
@@ -744,39 +1162,44 @@ class BacktestRunner:
                     target_weights = enforce_max_turnover(current_weights, target_weights, max_turnover)
 
                     tv = portfolio.total_value(prices)
-                    # 卖出不在 target 的
+                    # 卖出不在 target 的 (at open)
                     for code in list(portfolio.positions.keys()):
                         if code not in target_weights:
-                            if code in day_data and can_sell(day_data[code]):
+                            if code in day_data and code in prev_close_by_code:
                                 pos = portfolio.positions[code]
-                                close = float(day_data[code]["收盘价"])
-                                # PnL 需扣 sell_fee (同 exit 卖出)
-                                sell_amount = close * pos.shares
-                                pnl = (close - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
-                                portfolio.sell(code, close, date)
-                                all_trades.append({
-                                    "code": code, "pnl": pnl,
-                                    "holding_days": pos.holding_days, "signal": "rebalance",
-                                })
-                                all_events.append({
-                                    "code": code, "signal": "rebalance_out", "action": "executed",
-                                    "pnl": pnl, "holding_days": pos.holding_days,
-                                })
-                    # 买入新增的
+                                bar_series = day_data[code]
+                                prev_close = prev_close_by_code[code]
+                                if can_sell_at_open(bar_series, prev_close, code):
+                                    open_px = float(bar_series["开盘价"])
+                                    # PnL 需扣 sell_fee (同 exit 卖出)
+                                    sell_amount = open_px * pos.shares
+                                    pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
+                                    portfolio.sell(code, open_px, date)
+                                    all_trades.append({
+                                        "code": code, "pnl": pnl,
+                                        "holding_days": pos.holding_days, "signal": "rebalance",
+                                    })
+                                    all_events.append({
+                                        "code": code, "signal": "rebalance_out", "action": "executed",
+                                        "pnl": pnl, "holding_days": pos.holding_days,
+                                    })
+                    # 买入新增的 (at open)
                     for code, weight in target_weights.items():
                         if code in portfolio.positions:
                             continue
-                        if code not in day_data:
+                        if code not in day_data or code not in prev_close_by_code:
                             continue
-                        if not can_buy(day_data[code]):
+                        bar_series = day_data[code]
+                        prev_close = prev_close_by_code[code]
+                        if not can_buy_at_open(bar_series, prev_close, code):
                             all_events.append({
                                 "code": code, "signal": "entry", "action": "skipped",
-                                "reason": "limit_up", "pnl": None, "holding_days": None,
+                                "reason": "limit_up_at_open", "pnl": None, "holding_days": None,
                             })
                             continue
-                        close = float(day_data[code]["收盘价"])
+                        open_px = float(bar_series["开盘价"])
                         amount = tv * weight
-                        shares = int(amount / close / 100) * 100
+                        shares = int(amount / open_px / 100) * 100
                         if shares > 0:
                             # 获取触发入场的信号列表（调用策略方法）
                             if code in factors_by_code:
@@ -785,7 +1208,7 @@ class BacktestRunner:
                                 )
                             else:
                                 triggered_signals = []
-                            actual, cost = portfolio.buy(code, close, shares, date, entry_signals=triggered_signals)
+                            actual, cost = portfolio.buy(code, open_px, shares, date, entry_signals=triggered_signals)
                             if actual > 0:
                                 all_events.append({
                                     "code": code, "signal": "entry_combined", "action": "executed",
@@ -902,17 +1325,15 @@ class BacktestRunner:
         events_df = pd.DataFrame(events) if events else pd.DataFrame(columns=["code", "signal", "action", "pnl", "holding_days"])
 
         if self.mode == "weight":
-            # weight 模式: 整个组合用 initial_capital
+            # weight 模式: 单一账户，初始资本固定
             capital_base = self.initial_capital
         else:
-            # params 模式: per-stock base = len(self.universe) * per_stock_capital.
-            # 必须用 self.universe 长度, 不用 len(tested_codes), 因为 dv_series 是把
-            # universe 里所有股票 (含无交易的) 的 daily_value 加总, 所以分母也得对得上.
-            per_stock_capital = self.initial_capital * self.params.get("max_single_weight", 0.10)
-            if self.universe:
-                capital_base = len(self.universe) * per_stock_capital
+            # params 模式: daily_values 起点是动态的（受 day0 前没上市的股影响），
+            # 用 dv_series.iloc[0] 作为分母，而非写死的 len(universe)*per_stock
+            if len(dv_series) > 0 and dv_series.iloc[0] > 0:
+                capital_base = float(dv_series.iloc[0])
             else:
-                capital_base = self.initial_capital  # 无 universe fallback
+                capital_base = self.initial_capital  # fallback
 
         metrics = compute_metrics(capital_base, dv_series, trades_df)
 
@@ -1070,9 +1491,6 @@ class BacktestRunner:
         Path(output_path).write_text(md, encoding="utf-8")
 
 
-# ===== 工具函数 (别名) =====
-def should_rebalance_fn(bar_index: int, freq_bars: int) -> bool:
-    """bar_index: 0-based 交易日索引. 在 bar_index = 0, freq, 2*freq, ... 触发."""
-    if freq_bars <= 0:
-        return False
-    return bar_index % freq_bars == 0
+# ===== 工具函数 (从 portfolio.py 统一导入) =====
+# should_rebalance_fn 是 portfolio.should_rebalance 的别名, 保持向后兼容
+from .portfolio import should_rebalance as should_rebalance_fn

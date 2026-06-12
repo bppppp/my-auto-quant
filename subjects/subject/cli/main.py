@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..backtest.runner import BacktestRunner
+from .top300 import run_top300_optimize
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -27,9 +28,19 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="最多测试的股票数 (None = 全跑 300 只, 性能慢; 调试建议 5-10)")
     run.add_argument("--test-universe", default=None,
                      help="自定义测试股票代码列表 (逗号分隔, 带后缀, 如 '000001.SZ,600000.SH'); "
-                          "非空时覆盖 spec.test_universe, 然后再应用 --max-stocks")
+                          "非空时覆盖默认测试集; 默认从 test_universe/top300.md 读取(存在时),否则用 HS300")
     run.add_argument("--capital", type=float, default=300_000, help="初始资金")
     run.add_argument("--output", default=None, help="报告输出路径 (默认按 mode 规则)")
+
+    # run-top300 子命令
+    top300 = sub.add_parser("run-top300", help="Top300 测试集筛选（三轮全量回测 + params 调优）")
+    top300.add_argument("--strategy", required=True, help="策略目录名 (e.g. trend_breakout_atr_rsi)")
+    top300.add_argument("--rounds", type=int, default=3, help="调优轮数（默认 3）")
+    top300.add_argument("--max-retries", type=int, default=3, help="LLM 重试上限（默认 3）")
+    top300.add_argument("--start-date", default=None, help="top300 模式起始日期 YYYY-MM-DD (默认5 年)")
+    top300.add_argument("--end-date", default=None, help="top300 模式结束日期 YYYY-MM-DD (默认数据末日)")
+    top300.add_argument("--limit", type=int, default=None, help="top300 模式每轮回测的 limit (None = 不限)")
+
     return p
 
 
@@ -37,7 +48,28 @@ def _make_runner(args: argparse.Namespace) -> BacktestRunner:
     # 解析 --test-universe (逗号分隔 → list)
     test_universe_override: list[str] | None = None
     if args.test_universe:
+        # 用户显式指定
         test_universe_override = [s.strip() for s in args.test_universe.split(",") if s.strip()]
+    else:
+        # 默认从 test_universe/top300.md 读取，存在时使用，否则 fallback 到 HS300
+        from .top300 import get_test_universe
+        test_universe_override = get_test_universe(args.strategy)
+
+    # subjects_dir 使用项目根目录 (subjects/ 的父目录)
+    # 兼容 CLI 从 subjects/ 目录运行: subjects_dir="."
+    # 也兼容从项目根运行: subjects_dir=Path(__file__).parent.parent.parent
+    import sys
+    from pathlib import Path
+    _cli_dir = Path(__file__).resolve().parent  # cli/ 目录
+    _subject_dir = _cli_dir.parent.parent  # subjects/ 的父目录 (项目根)
+    # 如果当前目录有 subjects/ 子目录，说明是从项目根运行的
+    if (Path.cwd() / "subjects").exists():
+        _subjects_dir = Path.cwd()
+    # 如果当前目录本身就是 subjects/ 目录 (cwd/subject存在, cwd/backtest 不存在)
+    elif (Path.cwd() / "subject").exists() and not (Path.cwd() / "backtest").exists():
+        _subjects_dir = Path.cwd()
+    else:
+        _subjects_dir = _subject_dir
 
     return BacktestRunner(
         strategy_name=args.strategy,
@@ -46,7 +78,7 @@ def _make_runner(args: argparse.Namespace) -> BacktestRunner:
         start_date=args.start_date,
         end_date=args.end_date,
         initial_capital=args.capital,
-        subjects_dir=".",
+        subjects_dir=_subjects_dir,
         max_stocks=args.max_stocks,
         test_universe_override=test_universe_override,
     )
@@ -58,7 +90,18 @@ def _output_path(args: argparse.Namespace, monitor_meta: dict | None, version: s
     version: 实际跑的策略版本 (runner 已从 strategiesParam/strategiesWeight 选出的最新),
              透传到 report 文件名, 避免硬编码 v1 (v2 的回测不应再写 report_v1.md).
     """
-    base = Path(args.strategy)
+    # 使用与 _make_runner 相同的逻辑确定 subjects_dir，确保绝对路径
+    _cli_dir = Path(__file__).resolve().parent
+    _subject_dir = _cli_dir.parent.parent
+    if (Path.cwd() / "subjects").exists():
+        _subjects_dir = Path.cwd()
+    elif (Path.cwd() / "subject").exists() and not (Path.cwd() / "backtest").exists():
+        _subjects_dir = Path.cwd()
+    else:
+        _subjects_dir = _subject_dir
+
+    # 构建绝对路径: subjects_dir / strategy_name / reportParams|reportWeight / ...
+    base = _subjects_dir / args.strategy
     if args.mode == "params":
         d = base / "reportParams"
         if args.monitor or monitor_meta is not None:
@@ -122,11 +165,31 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_top300(args: argparse.Namespace) -> int:
+    """Top300 测试集筛选."""
+    result = run_top300_optimize(
+        name=args.strategy,
+        rounds=args.rounds,
+        max_retries=args.max_retries,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        limit=args.limit,
+    )
+    if result is None:
+        print(f"[ERROR] Top300 筛选失败")
+        return 1
+    print(f"[OK] Top300 测试集已写入: subjects/{args.strategy}/test_universe/top300.md")
+    print(f"      最优轮: Round {result.best_round}, 平均年化收益率: {result.best_avg_return:+.2%}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return cmd_run(args)
+    if args.cmd == "run-top300":
+        return cmd_top300(args)
     parser.print_help()
     return 1
 

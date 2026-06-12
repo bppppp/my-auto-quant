@@ -9,9 +9,13 @@
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from ._cache import try_get_cached_factor
+
+logger = logging.getLogger(__name__)
 
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -23,14 +27,27 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
     Returns:
         Series: 范围 0-100; 前 ``period`` 行为 NaN.
+        如果数据不足 period 行，返回全 NaN Series。
     """
     if period < 1:
         raise ValueError(f"period must be >= 1, got {period}")
-    # 预计算 cache 命中: 直接返回预计算的 Series
+
+    series_len = len(close)
+
+    # 1. 预计算 cache 命中: 直接返回预计算的 Series
     # 注: pre-compute 仅有 rsi_14. 其他 period 调用走运行时.
-    cached = try_get_cached_factor("rsi_14", length=len(close))
+    cached = try_get_cached_factor("rsi_14", length=series_len)
     if cached is not None:
         return cached
+
+    # 2. 数据不足 period+1 行（需要 period 行 + 1 行用于 diff）
+    if series_len < period + 1:
+        logger.debug(
+            f"[rsi] rsi_{period}: 数据不足 ({series_len} < {period + 1}), 返回全 NaN"
+        )
+        return pd.Series([float("nan")] * series_len, index=close.index)
+
+    # 3. 数据充足，正常计算
     diff = close.diff()
     gain = diff.clip(lower=0.0)
     loss = (-diff).clip(lower=0.0)

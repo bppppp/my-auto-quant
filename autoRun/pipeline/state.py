@@ -25,6 +25,7 @@ STATE_PATH = auto_run_dir() / "pipeline_state.json"
 STAGE_INIT = "init"
 STAGE_GENERATED = "generated"             # Stage A 完成
 STAGE_TRANSLATED = "translated"           # Stage B 完成
+STAGE_TOP300 = "top300"                   # Stage T 完成 (top300 测试集筛选)
 STAGE_PARAMS_LOOP = "params_loop"         # Stage C 进行中
 STAGE_PARAMS_DONE = "params_done"         # Stage C 完成
 STAGE_PICKED_PARAMS = "picked_params"     # Stage D 完成
@@ -227,6 +228,7 @@ __all__ = [
     "STAGE_INIT",
     "STAGE_GENERATED",
     "STAGE_TRANSLATED",
+    "STAGE_TOP300",
     "STAGE_PARAMS_LOOP",
     "STAGE_PARAMS_DONE",
     "STAGE_PICKED_PARAMS",
