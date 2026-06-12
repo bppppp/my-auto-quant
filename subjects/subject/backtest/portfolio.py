@@ -28,6 +28,13 @@ class Position:
     """入场后最高收盘价. 组合层每根 K 线更新: highest = max(previous_highest, close)."""
     entry_signals: list[str] = field(default_factory=list)
     """触发入场的信号名列表（如 ["trend_entry", "rsi_entry"]）。用于 exit 时关联统计。"""
+    entry_bar_idx: int = -1
+    """P2 #5 修复: 入场时在主循环中的 bar 索引 (0-based, 跨模式统一).
+    旧版 params 模式用 (date - entry_date).days 算日历日, weight 模式用 +=1 算 1-based 交易
+    日, 两者口径不同导致 time_stop 触发时机差异 ~1.4x. 新版统一为 1-based 交易日:
+    holding_days = current_bar_idx - entry_bar_idx + 1 (entry 当日 = 1, 次日 = 2, ...).
+    weight 模式不显式使用本字段 (沿用 update_after_bar 的 +=1, 行为等价);
+    params 模式显式读取以保证口径一致."""
 
     def to_state_dict(self) -> dict:
         """转成 strategy.should_exit(position, ...) 需要的 dict. 见 PARTS_SUMMARY.md §2.5."""
@@ -122,10 +129,15 @@ class Portfolio:
             pos.entry_price = new_total_cost / new_shares
             pos.highest = max(pos.highest, price)
         else:
+            # P3 体系 bug 修复: 新建 position 的 holding_days 初始为 1 (1-based 交易日)
+            # 旧版用 0, 配合 update_after_bar 的 +=1 实际是 "1-based" 没问题
+            # 但在 weight 模式中, buy 在 rebalance 之后, 同一天不会调用 update_after_bar,
+            # 导致新建的 position 保持 hd=0, 若第二天立即 exit, trade 记录 hd=0 (应为 1)
+            # 现在 buy 时直接设 hd=1, 与 params 模式 "1-based" 一致
             self.positions[code] = Position(
                 code=code, shares=shares,
                 entry_price=effective_entry, entry_date=date,
-                highest=price, holding_days=0,
+                highest=price, holding_days=1,
                 entry_signals=entry_signals or [],
             )
         self.history.append({
@@ -188,7 +200,14 @@ def enforce_max_single_weight(
         max_pct: 单票上限 (小数, 如 0.10).
 
     Returns:
-        调整后 weights, 总和仍 = 1.
+        调整后 weights, 总和可能 < 1 (让 fill_cash_with_remaining_candidates 补齐).
+
+    修复 (P3 体系 bug):
+        旧版本在 cap 后无条件 re-normalize, 导致:
+        - 8 只股各 0.125, cap 到 0.10, re-normalize 后变回 0.125, cap 完全失效
+        - 1 只股 0.125, cap 到 0.10, re-normalize 后变成 1.0, 整组合只买 1 只
+        新版本: 仅当 sum > 1 时 re-normalize (overweight 场景, 例如 cap 后还有负 excess),
+        sum < 1 时保留 (underweight, 由 fill_cash 补齐)
     """
     if not weights or max_pct <= 0:
         return weights
@@ -209,12 +228,13 @@ def enforce_max_single_weight(
             for k in others:
                 out[k] *= scale
         else:
-            # 全部触顶 → 等比缩放到 max_pct，然后归一化到总和=1
+            # 全部触顶 → 全部 cap 到 max_pct, 保留 sum < 1
             for k in out:
                 out[k] = max_pct
-    # 归一化：确保总和回到 1.0（避免 sum<1 导致后续 enforcer 错误放大）
+    # 归一化: 仅当 sum > 1 时 re-normalize (overweight)
+    # sum < 1 时保留, 由 fill_cash 补齐
     s = sum(out.values())
-    if s > 0 and abs(s - 1.0) > 1e-6:
+    if s > 1.0 + 1e-6:
         out = {k: v / s for k, v in out.items()}
     return out
 
@@ -230,6 +250,11 @@ def enforce_industry_concentration(
         weights: {code: weight}.
         industry_map: {code: industry_name} (由 :func:`load_industry_map` 构造).
         max_pct: 单一行业上限 (小数, 如 0.30).
+
+    Returns:
+        调整后 weights, sum 可能 < 1 (让 fill_cash 补齐).
+
+    修复 (P3 体系 bug): 同 enforce_max_single_weight, 不再 re-normalize 让 cap 失效.
     """
     if not weights or max_pct <= 0:
         return weights
@@ -252,10 +277,10 @@ def enforce_industry_concentration(
         out[code] = w * scale[ind]
         if scale[ind] < 1.0:
             any_scaled = True
-    # 只有真正触发了行业超限（做了缩放）才归一化；安全情况下保持原样
+    # 归一化: 仅当 sum > 1 时 re-normalize, sum < 1 保留 (fill_cash 补)
     if any_scaled:
         s = sum(out.values())
-        if s > 0 and abs(s - 1.0) > 1e-6:
+        if s > 1.0 + 1e-6:
             out = {k: v / s for k, v in out.items()}
     return out
 
@@ -313,6 +338,97 @@ def enforce_max_turnover(
         cur = current.get(c, 0.0)
         tgt = target.get(c, 0.0)
         out[c] = cur + (tgt - cur) * scale
+    return out
+
+
+def fill_cash_with_remaining_candidates(
+    target_weights: dict[str, float],
+    scores: dict[str, float],
+    target_n: int,
+    max_single: float,
+    industry_map: dict[str, str] | None = None,
+    max_industry: float = 1.0,
+    cash_threshold: float = 0.01,
+    max_n_multiplier: float = 2.0,
+) -> dict[str, float]:
+    """P3 #9/#11 修复: 用剩余候选股填满 cash 沉淀.
+
+    当 enforce_max_turnover / enforce_industry_concentration 缩放后,
+    target_weights 总和 < 1, 剩余 cash 没被投资. 此函数从 scores 字典里
+    按 score 降序挑选不在 target_weights 中的候选, 平分剩余 cash 加入, 直至
+    - 剩余 cash < cash_threshold
+    - 或持仓数达到 target_n × max_n_multiplier (安全上限)
+    - 或无更多 score > 0 的候选
+
+    Args:
+        target_weights: 当前 target (可能 sum < 1)
+        scores: 所有有 score 的候选股
+        target_n: 目标持仓数
+        max_single: 单票最大权重
+        industry_map: 行业映射 (None 时不 enforce 行业)
+        max_industry: 行业最大权重
+        cash_threshold: 触发 fill 的 cash 阈值 (默认 1%)
+        max_n_multiplier: 持仓数上限倍数 (默认 2 × target_n)
+
+    Returns:
+        调整后 target_weights (sum 严格 ≤ 1)
+
+    Bug #3 修复: 原版在循环中"现有持仓 ×n_total/(n_total-1) + 新候选 1/n_total",
+    即使每只单独 cap 到 max_single, 多只都触顶时 sum 仍可能 > 1.
+    新版: 现有持仓不动, 新候选 weight = leftover (加完 sum=1), 满足 cap 后再 leftover 平分给下一个.
+    这样天然 sum <= 1, 不需要事后 re-normalize (re-normalize 会让 cap 失效).
+    """
+    if not scores or not target_weights:
+        return target_weights
+
+    leftover = 1.0 - sum(target_weights.values())
+    if leftover < cash_threshold:
+        return target_weights
+
+    in_target = set(target_weights.keys())
+    # 按 score 降序排列, score > 0, 不在 target 中
+    candidates = sorted(
+        [(c, s) for c, s in scores.items() if c not in in_target and s > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    out = dict(target_weights)
+    max_n = int(target_n * max_n_multiplier)
+
+    for code, _score in candidates:
+        if len(out) >= max_n:
+            break
+        leftover = 1.0 - sum(out.values())
+        if leftover < cash_threshold:
+            break
+
+        # 新候选 weight 初始 = leftover (理想情况下加完 sum=1)
+        new_w = leftover
+
+        # cap 单票: 如果 new_w > max_single, 先 cap 到 max_single, 剩余 cash 留给后续候选
+        if max_single > 0 and new_w > max_single:
+            new_w = max_single
+
+        # enforce 行业: 行业超限时, 缩到该行业剩余配额
+        if industry_map is not None and max_industry < 1.0:
+            ind = industry_map.get(code, "unknown")
+            current_ind_total = sum(
+                w for c, w in out.items() if industry_map.get(c, "unknown") == ind
+            )
+            ind_room = max_industry - current_ind_total
+            if ind_room <= 0:
+                # 该行业已满, 跳过这个候选
+                continue
+            if new_w > ind_room:
+                new_w = ind_room
+
+        if new_w < cash_threshold:
+            # 加了也不够 cash_threshold, 跳过
+            continue
+
+        out[code] = new_w
+
     return out
 
 

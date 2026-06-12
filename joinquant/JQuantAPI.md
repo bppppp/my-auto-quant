@@ -1361,3 +1361,439 @@ if PARAMS.get('static_universe', False):
 - PARAMS 中**只放标量**(int / float / bool / 短字符串)
 - 长列表 / dict / 嵌套结构 → 独立模块级常量
 
+---
+
+## 17. 实战踩坑总结 (从 multi_factor_trend_swing 移植过程)
+
+> 本节是从 spec → JQ 回测代码的端到端实战中**真实踩过**的坑。
+> §16 偏 API 文档式的"可能出错",本节偏"实际移植时**一定**会出错的步骤"。
+
+### 17.1 引擎环境:Python 3.6 + 行为异常 numpy
+
+聚宽 JQBoson 引擎**不是**标准 CPython。`JQuantAPI.md` 顶部明确标注 `Python3.6 环境`。
+
+#### 17.1.1 PEP 585 不可用 (Python 3.9+)
+
+| 写法 | 是否可用 |
+|---|---|
+| `HS300_CODES: list[str] = [...]` | ❌ 抛 `TypeError: 'type' object is not subscriptable` |
+| `PARAMS: dict[str, int] = {...}` | ❌ 同上 |
+| `def f() -> int \| None:` (PEP 604) | ❌ 同上 |
+| `f"{x=}"` debug 语法 (3.8+) | ❌ |
+| `:=` walrus (3.8+) | ❌ |
+| `match/case` (3.10+) | ❌ |
+
+**症状**:
+```python
+TypeError: 'type' object is not subscriptable
+```
+通常报错的**位置不是注解所在行**,而是**该 dict/list 表达式的最后一行**(Python 内部先解析表达式再处理注解)。
+
+**修复**:把所有 `list[str]` / `dict[str, X]` / `X | Y` 改为**无注解**:
+```python
+# ❌ 错
+HS300_CODES: list[str] = [...]
+# ✅ 对
+HS300_CODES = [...]
+```
+
+如果必须保留类型注解,加 `from __future__ import annotations` 让所有注解变字符串(lazy 求值)。但本项目**未依赖任何类型注解**,无需加。
+
+#### 17.1.2 `np.isnan(合法正数)` 误判为 `True` ⚠️ 最诡异
+
+**症状**:
+```python
+>>> import numpy as np
+>>> ma_10 = 28.329  # 标准 Python 浮点
+>>> np.isnan(ma_10)
+False  # 标准 CPython
+True   # JQBoson (引擎下行为异常!)
+```
+
+标准 CPython 下 `np.isnan(任何正数)` 都是 `False`,但 **JQBoson 引擎下** `np.isnan(28.329)` 等合法正数**会返回 `True`**(可能因为 numpy 版本,或 JQ 自定义覆盖)。
+
+**影响范围**:
+- `if any(x is None or np.isnan(x) for x in [ma_10, ma_30, ma_60]):` — 对合法值也触发 `return None`
+- 整个因子计算函数被静默短路
+- 信号评分全部 `return 0.0` → 全市场无交易
+
+**修复**:**用 `np.isfinite` 代替 `not np.isnan`**。
+
+```python
+# ❌ 错 (JQ 平台会误判)
+if any(x is None or np.isnan(x) for x in [ma_10, ma_30, ma_60]):
+    return None
+
+# ✅ 对 (np.isfinite 在 JQ 平台行为正确, 只对 NaN/inf/-inf 返回 False)
+factors = {'ma_10': ma_10, 'ma_30': ma_30, 'ma_60': ma_60, ...}
+for k, v in factors.items():
+    if not np.isfinite(v):
+        return None
+```
+
+**原则**:在 JQ 平台**任何代码路径**遇到 `np.isnan(用户输入)` 都应警惕。**统一在函数末尾**用 `np.isfinite` 验证,不在中间路径用 `np.isnan` 短路。
+
+#### 17.1.3 引擎实际跑出来可能与本地 Python 行为不同
+
+**教训**:本地能跑的代码 ≠ JQ 平台能跑。关键 quirk(§16 + §17.1.2)必须在 **JQ 回测**中验证,本地无法复现。
+
+### 17.2 `get_current_data()` 是按需加载(lazy loading),`cd.get()` 不会触发
+
+**症状**(最常见的"无交易"原因):
+```python
+cd = get_current_data()
+for s in stock_list:
+    d = cd.get(s)        # ❌ 永远返回 None
+    if d is None: continue
+```
+日志输出:
+```
+filter_universe: 退市/未上市=300 停牌=0 ST=0 数据不足=0 通过=0
+```
+
+**根因**:`JQuantAPI.md` §3 明确写:
+> `get_current_data()` — 返回 dict(代码→对象), **按需获取(初始为空, 访问时加载)**
+
+也就是说:
+- `cd = get_current_data()` 返回的 dict **初始为空**
+- `cd.get(s)` 不会触发 lazy loading,直接返回 `None`
+- **必须用 `cd[s]` 触发加载**,或先 `set_universe(stock_list)` 预填
+
+**修复 A (donchian 模式,用 `cd[s]`)**:
+```python
+try:
+    d = cd[s]            # ✅ 触发 lazy loading
+except KeyError:
+    continue             # 股票不在 JQ 数据库 (退市/未上市)
+```
+
+**修复 B (预填,更稳)**:
+```python
+def initialize(context):
+    set_universe(HS300_CODES_JQ)   # 预填 300 只到 cd dict
+    ...
+```
+`set_universe()` 是为 `history()` 设默认 security_list,**但同时**也预填 `get_current_data()` 的 dict,使 `cd.get(s)` 对有效股票能正确返回。
+
+**推荐两个一起用**:
+```python
+def initialize(context):
+    set_universe(stock_list)       # 预填 + 设 history() 默认池
+
+def filter_universe(raw_list, context):
+    cd = get_current_data()
+    for s in raw_list:
+        try:
+            d = cd[s]              # 触发 lazy loading (兜底)
+        except KeyError:
+            continue              # 真正无效的股票
+```
+
+**为什么 §16.3 推荐 `cd.get()` 是错的**:§16.3 假设 dict **已被预填**(因为有访问历史),但**首次访问** `cd.get(s)` 永远返回 `None`。**真正可靠的模式是 `cd[s] + try/except KeyError`**。
+
+### 17.3 静态股票列表的代码转换规则
+
+`data/config.py.HS300` 等本地列表是 **6 位纯数字**(`'000001'`, `'300750'`, `'688981'`),**不带交易所后缀**。聚宽要求带后缀(`.XSHE` / `.XSHG`)。
+
+**规则**:
+| 6 位代码开头 | 后缀 | 交易所 |
+|---|---|---|
+| `0` (深市主板) | `.XSHE` | 深圳 |
+| `3` (深市创业板/中小) | `.XSHE` | 深圳 |
+| `6` (沪市主板,含 688 科创板) | `.XSHG` | 上海 |
+| `8` / `4` (北交所) | `.BJ` (少数平台) | 北京 |
+
+**代码**:
+```python
+HS300_CODES_RAW = ['000001', '300750', '600519', '688981', ...]
+
+HS300_CODES_JQ = [
+    (c + '.XSHG' if c.startswith('6') else c + '.XSHE')
+    for c in HS300_CODES_RAW
+]
+```
+
+**注意**:
+- 688 (科创板) 也用 `.XSHG`(属上交所)
+- 304 (北交所) 不在 HS300 中,无需处理
+- 4 / 8 开头在 HS300 / CSI1000 中也不出现
+
+### 17.4 `attribute_history(..., skip_paused=True) + len < 60` 太严
+
+**症状**: 静态列表 300 只 → 全部被 filter 掉。
+
+**代码**(donchian 风格):
+```python
+hist = attribute_history(s, 60, '1d', ['close'], skip_paused=True, df=False, fq='pre')
+if hist is None or len(hist['close']) < 60:
+    continue  # 跳过
+```
+
+**根因**:`skip_paused=True` **跳过停牌日**,所以:
+- 一只股过去 60 个交易日里只要有 1 天停牌 → `len(hist['close']) = 59` → 跳过
+- A 股 300 只里,过去 60 个交易日有过停牌的占**大多数**
+
+**修复**:
+```python
+# 1. skip_paused=False (停牌日填 NaN, 行数保证 = count)
+hist = attribute_history(s, 70, '1d', ['close'], skip_paused=False, df=False, fq='pre')
+if hist is None or len(hist['close']) < 60:
+    continue
+# 2. 只看最近 30 日是否全 NaN (排除上市未满 60 日)
+recent = hist['close'][-30:]
+if any(np.isnan(recent)):
+    continue
+```
+
+**额外建议**:`n=70` 而非 `n=60`,留 10 日 buffer,防止边界情况。
+
+### 17.5 "回测无交易"完整诊断 checklist
+
+| 阶段 | 检查项 | 修复 |
+|---|---|---|
+| `filter_universe` | `退市/未上市=N` (N > 0 但预期不该有) | `cd.get()` → `cd[s] + try/except` + `set_universe()` |
+| `filter_universe` | `停牌=N` 太多 | 区分"今日停牌"(必须跳过) vs "过去停牌日"(放宽) |
+| `filter_universe` | `ST=N` 太多 | 正常,ST 真的不能买 |
+| `filter_universe` | `数据不足=N` 太多 | `skip_paused=True → False` + `n=70` |
+| `filter_universe` | `通过=0` 全部 300 都退市 | `cd.get()` bug,见 §17.2 |
+| `calc_factors_batch` | `KeyError(history)=N` 大 | `df_close[stock]` 失败,可能 history 返回空,加 shape 日志 |
+| `calc_factors_batch` | `数据不足=N` 大 | `len(close.dropna()) < 60`,改 `n=70` 或放宽到 `< 50` |
+| `calc_factors_batch` | `NaN末值=N` 大 | 末日是停牌,正常跳过 |
+| `calc_factors_batch` | `计算返回None=N` 大 | **`np.isnan` 误判**!改用 `np.isfinite` 末尾验证,见 §17.1.2 |
+| `calc_factors_batch` | `异常=N` 大 | 拿到 `首个异常: stock=..., err=...` 直接看 |
+| `entry_score` | `score=0.00` 全部 | **同 17.1.2 误判**!`if any(x is None or np.isnan(x)...)` 全 return 0.0 |
+| `entry_score` | `最高 < 0.50` (评分低) | 信号过严,调 `min_entry_score` 或放宽触发条件 |
+| `execute_rebalance` | `无目标持仓` 全部清仓 | 评分不足,见上一行 |
+
+### 17.6 诊断日志模板(推荐复制粘贴)
+
+```python
+def calc_factors_batch(stock_list, context):
+    log.info("  calc_factors_batch: 开始, 输入=%d 只, n=%d 天" % (len(stock_list), n))
+
+    df_close = history(n, '1d', 'close', stock_list, df=True, skip_paused=False, fq='pre')
+    if df_close is None or df_close.empty:
+        log.warn("  calc_factors_batch: history() 返回空")
+        return None
+
+    # 抽样: 第一只股票的数据
+    sample = list(df_close.columns)[0]
+    sample_close = df_close[sample]
+    log.info("  样本 %s: len=%d, 有效=%d, 末值=%s, 全 NaN=%s" %
+             (sample, len(sample_close), len(sample_close.dropna()),
+              sample_close.iloc[-1], sample_close.isna().all()))
+
+    rows = {}
+    n_keyerr = n_short = n_nan = n_calc_fail = n_exc = 0
+    first_exc = None
+    for stock in stock_list:
+        try:
+            close, high, low, vol = df_close[stock], df_high[stock], df_low[stock], df_vol[stock]
+        except KeyError:
+            n_keyerr += 1; continue
+        if close is None or len(close.dropna()) < 60:
+            n_short += 1; continue
+        if np.isnan(close.iloc[-1]):
+            n_nan += 1; continue
+        try:
+            d = cd[stock]
+        except KeyError:
+            d = None
+        current_close = d.last_price if (d and d.last_price > 0) else close.iloc[-1]
+        try:
+            row = _calc_factors_core(close, high, low, vol, current_close, p)
+            if row is not None:
+                rows[stock] = row
+            else:
+                n_calc_fail += 1
+        except Exception as e:
+            n_exc += 1
+            if first_exc is None: first_exc = (stock, str(e))
+
+    log.info("  失败分类: KeyError=%d 数据不足=%d NaN=%d 计算返回None=%d 异常=%d 成功=%d" %
+             (n_keyerr, n_short, n_nan, n_calc_fail, n_exc, len(rows)))
+    if first_exc:
+        log.warn("  首个异常: stock=%s, err=%s" % first_exc)
+    return pd.DataFrame.from_dict(rows, orient='index') if rows else None
+```
+
+### 17.7 `_calc_factors_core` 推荐写法 (绕过 §17.1.2)
+
+```python
+def _calc_factors_core(close, high, low, vol, current_close, p):
+    # 直接计算,不做中间 NaN 检查
+    ma_10 = close.rolling(p['ma_short']).mean().iloc[-1]
+    ma_30 = close.rolling(p['ma_mid']).mean().iloc[-1]
+    ma_60 = close.rolling(p['ma_long']).mean().iloc[-1]
+    # ... 其他因子
+
+    # prev_close_60 用 self != self NaN trick
+    prev_close_60 = close.shift(p['mom_period']).iloc[-1]
+    if prev_close_60 is None or (isinstance(prev_close_60, float) and prev_close_60 != prev_close_60) or prev_close_60 <= 0:
+        return None
+    mom_60 = current_close / prev_close_60 - 1
+
+    factors = {...}
+    # 末尾统一用 np.isfinite 验证
+    for k, v in factors.items():
+        if not np.isfinite(v):
+            return None
+    return factors
+```
+
+**核心原则**:
+1. **不在计算中间** 用 `np.isnan(x)` 短路
+2. **在计算末尾** 用 `np.isfinite(v)` 统一验证
+3. 对不可避免的中间检查(如除零保护),用 `self != self` NaN trick 或 `x is None` 守护
+
+### 17.8 静态股票池 vs `set_universe` 的取舍
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| `get_index_stocks('000300.XSHG')` | JQ 自动维护,新调入自动包含 | 受指数调样影响,跨期结果不可比 |
+| 静态 `HS300_CODES_JQ` 列表 | **跨期可比**,与本地引擎对齐 | 不随时间更新,需手动维护 |
+
+**推荐**:用**本地静态列表**,与本地回测引擎 (`subjects/subject/backtest`) 用同一份 `data/config.py.HS300`,保证两套回测结果**股票池完全一致**。
+
+**配 `set_universe(HS300_CODES_JQ)`** 让 `history()` 和 `get_current_data()` 都能正确返回 300 只的数据。
+
+### 17.9 关于 `history()` vs `attribute_history()`
+
+| 函数 | 用途 | 性能 |
+|---|---|---|
+| `history(N, field, security_list, df=True)` | 批量取多只股的**单字段** | 一次调用,快 |
+| `attribute_history(security, N, fields, df=True)` | 取**单只股**的多字段 | 一次一只,慢 |
+
+**性能建议**:
+- **多股单字段** → `history()` 批量 (如 `df_close = history(N, '1d', 'close', stock_list, df=True)`)
+- **单股多字段** → `attribute_history()` (如 `df = attribute_history(s, 70, '1d', ['open','high','low','close','volume'])`)
+
+混合使用:`history()` 批量取 4 个字段,4 次调用;**而不是**为每只股循环 `attribute_history()`(272 × N 倍慢)。
+
+### 17.10 完整 5+1 套防御
+
+把上面所有坑都综合起来,**一个稳健的 JQ 策略代码应包含**:
+
+```python
+# ===== 1. initialize =====
+def initialize(context):
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    set_order_cost(OrderCost(...), type='stock')
+    set_slippage(FixedSlippage(0.0005))
+    log.set_level('order', 'error')
+
+    # 预填 cd dict (§17.2)
+    set_universe(STOCK_LIST_JQ)
+
+    g.trade_days_set = set(get_all_trade_days().tolist())  # §16.6 守卫
+    run_daily(before_market_open, '09:00')
+    run_daily(market_rebalance, '14:55')
+    run_daily(check_stops_daily, '15:00')
+
+    g.params = PARAMS
+    g.holdings = {}
+    g.rebalance_counter = 0
+    g.universe = []
+    g.industry_map = {}
+
+# ===== 2. filter_universe: skip_paused=False + cd[s] =====
+def filter_universe(raw_list, context):
+    cd = get_current_data()
+    n_total = len(raw_list)
+    n_none = n_paused = n_st = n_data = 0
+    out = []
+    for s in raw_list:
+        try:
+            d = cd[s]              # ✅ 触发 lazy loading
+        except KeyError:
+            n_none += 1; continue
+        if d.paused:
+            n_paused += 1; continue
+        if d.is_st:
+            n_st += 1; continue
+        try:
+            hist = attribute_history(s, 70, '1d', ['close'],
+                                       skip_paused=False, df=False, fq='pre')  # ✅ §17.4
+        except Exception:
+            n_data += 1; continue
+        if hist is None or len(hist['close']) < 60:
+            n_data += 1; continue
+        recent = hist['close'][-30:]
+        if any(np.isnan(recent)):
+            n_data += 1; continue
+        out.append(s)
+    log.info("  filter_universe: 原始=%d 退市=%d 停牌=%d ST=%d 数据=%d 通过=%d" %
+             (n_total, n_none, n_paused, n_st, n_data, len(out)))
+    return out
+
+# ===== 3. _calc_factors_core: 末尾 np.isfinite 验证 (§17.1.2) =====
+def _calc_factors_core(close, high, low, vol, current_close, p):
+    ma_10 = close.rolling(p['ma_short']).mean().iloc[-1]
+    ma_30 = close.rolling(p['ma_mid']).mean().iloc[-1]
+    ma_60 = close.rolling(p['ma_long']).mean().iloc[-1]
+    atr_14 = ...
+    rsi_14 = ...
+    prev_close_60 = close.shift(p['mom_period']).iloc[-1]
+    if prev_close_60 is None or prev_close_60 != prev_close_60 or prev_close_60 <= 0:
+        return None
+    mom_60 = current_close / prev_close_60 - 1
+
+    factors = {'close': float(current_close), 'ma_10': float(ma_10), ...}
+    for k, v in factors.items():
+        if not np.isfinite(v):
+            return None
+    return factors
+
+# ===== 4. entry_score: 不在中间用 np.isnan =====
+def entry_score(f, p):
+    score = 0.0
+    for k in ['close', 'ma_10', 'ma_30', 'ma_60', 'atr_14',
+              'volume_ratio_20', 'mom_60', 'rsi_14']:
+        if f.get(k) is None:
+            return 0.0
+    close = f['close']
+    if close <= 0:
+        return 0.0
+    # ... 5 个 if 加分 ...
+    return score
+
+# ===== 5. 交易: cd[s] + 科创板限价单 =====
+for stock, value in target_weights.items():
+    try:
+        d = cd[stock]              # ✅ 触发 lazy loading
+    except KeyError:
+        continue
+    if d.paused: continue
+    if d.high_limit > 0 and d.last_price >= d.high_limit: continue  # ✅ §16.5
+    last_price = d.last_price
+    if last_price <= 0 or np.isnan(last_price): continue
+    lot_size = 200 if stock.startswith('688') else 100  # ✅ §16.8
+    ...
+    if stock.startswith('688'):
+        order(stock, delta, LimitOrderStyle(min(last_price * 1.005, 9999.99)))
+    else:
+        order(stock, delta)        # ✅ §16.9
+```
+
+**这套模板**已经把 §16 + §17 全部 14 个 quirk 综合覆盖。可以直接作为新策略移植的起点。
+
+### 17.11 给移植新策略的检查表
+
+移植新策略时,按这个顺序检查:
+
+1. **Python 3.6 兼容**:所有 `list[X]` / `X | Y` 改为无注解或加 `from __future__ import annotations`
+2. **cd 预填**:`initialize()` 加 `set_universe(stock_list)`,**所有** `cd.get(s)` 改 `cd[s] + try/except KeyError`
+3. **历史过滤**:`attribute_history(skip_paused=True) + len < N` 改 `skip_paused=False + n=N+10 + 检查最近 30 日`
+4. **因子计算**:`_calc_factors_core` 末尾用 `np.isfinite` 统一验证,**不在中间用 `np.isnan` 短路**
+5. **信号评分**:`entry_score` 不检查 `np.isnan`,只检查 `None` 和 `close <= 0`
+6. **下单**:
+   - 科创板(688) → `LimitOrderStyle(price * 1.005)`
+   - 主板 → `order(stock, delta_shares)` 不用 `order_target_value`
+7. **filters**:所有 `d.high_limit/low_limit` 比较前加 `> 0` 守护
+8. **PARAMS**:长列表放模块级常量,**不**放 `g.params`
+9. **回测期守卫**:`run_daily` 入口加 `_is_trading_day()` 守卫(模拟盘准备)
+10. **诊断**:第一版加完整 `filter_universe` / `calc_factors_batch` / `entry_score` 诊断日志,先跑一次确认全流程无静默失败
+
+跑出 0 笔交易时,按 §17.5 checklist 逐项定位。
+

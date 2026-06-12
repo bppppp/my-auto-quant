@@ -1,17 +1,19 @@
 """信号触发统计. 见 subject.md §6.1.
 
 每个信号 (entry / exit) 单独统计:
-- triggered: 触发次数
+- triggered: 入场触发次数 (action=='triggered')
+- exits: 出场次数 (action=='exit_linked'), 与 triggered 一起反映"入场-出场"闭环完成度
 - swallowed: 触发但未执行次数 (涨跌停被吞)
 - skipped: 跳过次数
 - win_count: 触发出场且盈利次数
-- win_rate: win_count / triggered
+- win_rate: win_count / len(pnls)  (注意: 不是 / triggered)
 - avg_return: 平均盈亏
 - median_holding_days: 中位持仓天数
 - holding_days_dist: 持仓天数分布 {5: count, 10: count, ...}
 - pnl_percentile: 盈亏分位数 {p25: val, p50: val, p75: val, p90: val, ...}
 
 注意: entry 信号会收到 "exit_linked" 事件 (关联到对应出场时的 pnl/holding_days)。
+Bug #2 修复: triggered 不再含 exit_linked 计数, 避免被翻倍.
 """
 from __future__ import annotations
 
@@ -26,6 +28,9 @@ import pandas as pd
 class SignalStats:
     signal: str
     triggered: int
+    """入场触发次数 (action=='triggered'). Bug #2 修复: 不再含 executed/exit_linked."""
+    exits: int
+    """出场次数 (action=='exit_linked'). 与 triggered 一起反映"入场-出场"闭环完成度."""
     swallowed: int
     skipped: int
     win_count: int
@@ -77,6 +82,7 @@ def compute_pnl_percentiles(pnls: pd.Series) -> dict[str, float]:
 def compute_signal_stats(
     signal: str,
     events: pd.DataFrame,
+    signal_type: str = "entry",
 ) -> SignalStats:
     """计算单个信号的统计.
 
@@ -87,6 +93,11 @@ def compute_signal_stats(
             - ``action``: ``"triggered"`` / ``"executed"`` / ``"swallowed"`` / ``"skipped"`` / ``"exit_linked"``
             - ``pnl``: 盈亏 (元, executed/exit_linked 事件有值)
             - ``holding_days``: 持仓天数 (executed/exit_linked 事件有值)
+        signal_type: ``"entry"`` (入场信号) 或 ``"exit"`` (出场信号).
+            - entry 信号: triggered 字段 = action=='triggered' 次数 (入场触发)
+            - exit 信号: triggered 字段 = action in [executed, swallowed, skipped] 次数 (出场触发)
+              因为 exit 信号的事件流没有 action='triggered' (它直接到 executed/swallowed),
+              必须按 exit 信号的事件流统计, 否则 triggered 会=0.
 
     Returns:
         :class:`SignalStats`.
@@ -94,15 +105,21 @@ def compute_signal_stats(
     sub = events[events["signal"] == signal]
     if len(sub) == 0:
         return SignalStats(
-            signal, 0, 0, 0, 0, 0.0, 0.0, 0.0,
+            signal, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0,
             holding_days_dist={5: 0, 10: 0, 15: 0, 20: 0, 25: 0, 30: 0, "+∞": 0},
             pnl_percentiles={"p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0}
         )
 
-    # triggered: triggered/executed/exit_linked 都算触发
-    triggered = int((sub["action"] == "triggered").sum())
-    triggered += int((sub["action"] == "executed").sum())
-    triggered += int((sub["action"] == "exit_linked").sum())
+    # Bug #2 修复 (round 2): 按 signal_type 区分 triggered 统计口径.
+    # - entry 信号: triggered = action=='triggered' (入场触发)
+    # - exit 信号: triggered = action in [executed, swallowed, skipped] (出场触发)
+    #   原因: exit 信号的事件流没有 action='triggered', 只有 executed/swallowed/skipped
+    #   (line 1305/1317/1498: 直接从策略 should_exit 返回到成交/被吞, 不经过 triggered 中间态)
+    if signal_type == "exit":
+        triggered = int(sub["action"].isin(["executed", "swallowed", "skipped"]).sum())
+    else:
+        triggered = int((sub["action"] == "triggered").sum())
+    exits = int((sub["action"] == "exit_linked").sum())
     swallowed = int((sub["action"] == "swallowed").sum())
     skipped = int((sub["action"] == "skipped").sum())
 
@@ -111,10 +128,20 @@ def compute_signal_stats(
     hd = sub.loc[sub["action"].isin(["executed", "exit_linked"]), "holding_days"].dropna()
 
     if len(pnls) == 0:
+        # 修复 (P1-1 v3): 11 个字段全部按位置参数顺序传, 不再混合 keyword.
+        # 旧版传了 10 个位置参数 + 2 个 keyword, holding_days_dist 字段被冲突赋值.
         return SignalStats(
-            signal, triggered, swallowed, skipped, 0, 0.0, 0.0, 0.0,
-            holding_days_dist={5: 0, 10: 0, 15: 0, 20: 0, 25: 0, 30: 0, "+∞": 0},
-            pnl_percentiles={"p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0}
+            signal,           # signal
+            triggered,        # triggered
+            exits,            # exits
+            swallowed,        # swallowed
+            skipped,          # skipped
+            0,                # win_count
+            0,                # win_rate
+            0.0,              # avg_return
+            0.0,              # median_holding_days
+            {5: 0, 10: 0, 15: 0, 20: 0, 25: 0, 30: 0, "+∞": 0},  # holding_days_dist
+            {"p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0},  # pnl_percentiles
         )
 
     win_count = int((pnls > 0).sum())
@@ -129,6 +156,7 @@ def compute_signal_stats(
     return SignalStats(
         signal=signal,
         triggered=triggered,
+        exits=exits,
         swallowed=swallowed,
         skipped=skipped,
         win_count=win_count,

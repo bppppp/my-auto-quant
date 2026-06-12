@@ -1088,7 +1088,7 @@ python -m subject.cli run --strategy <name> --mode weight --weight-test <test_na
 | 最大回撤 | max_drawdown | ... |
 
 ## Signal Stats
-| signal | triggered | swallowed | skipped | win_count | win_rate | avg_return | median_holding_days |
+| signal | triggered | exits | swallowed | skipped | win_count | win_rate | avg_return | median_holding_days |
 | ... |
 
 ## Factor Value Stats

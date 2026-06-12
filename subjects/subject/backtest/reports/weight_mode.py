@@ -93,11 +93,12 @@ def render_weight_report(
     # Signal Stats
     lines.append("## Signal Stats")
     lines.append("")
-    lines.append("| 信号名 | 触发次数 | 被吞次数 | 跳过次数 | 盈利次数 | 胜率 | 平均收益 | 中位持仓天数 |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    # Bug #2 修复: 新增 '出场次数' 列, 反映"入场-出场"闭环完成度
+    lines.append("| 信号名 | 触发次数 | 出场次数 | 被吞次数 | 跳过次数 | 盈利次数 | 胜率 | 平均收益 | 中位持仓天数 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for s in signal_stats:
         lines.append(
-            f"| {s.signal} | {s.triggered} | {s.swallowed} | {s.skipped} | "
+            f"| {s.signal} | {s.triggered} | {s.exits} | {s.swallowed} | {s.skipped} | "
             f"{s.win_count} | {s.win_rate:.2%} | {s.avg_return:.2f} | {s.median_holding_days:.1f} |"
         )
     lines.append("")

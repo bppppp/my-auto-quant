@@ -565,7 +565,7 @@ CONFIG = StrategyConfig(
 | 元信息 | strategy / version / date |
 | **测试条件（新增）** | 中文名（测试集 / 实际测试股票数 / 测试起始日期 / 测试结束日期 / 股票数限制） \| 英文名（test_universe / universe_size / start_date / end_date / limit） \| 值 |
 | Metrics（7 项，3 列展示） | 中文名（年化收益 / 年化收益率 / 年化收益额 / 胜率 / 盈亏比 / 夏普 / 最大回撤） \| 英文名（annual_return / avg_annual_return_rate / avg_annual_return_amount / win_rate / profit_loss_ratio / sharpe / max_drawdown） \| 值 |
-| Signal Stats | 每信号 triggered / swallowed / skipped / win_count / win_rate / avg_return / median_holding_days |
+| Signal Stats | 每信号 triggered / exits / swallowed / skipped / win_count / win_rate / avg_return / median_holding_days |
 | Factor Value Stats | 每因子 min / max / mean / std / p25 / p50 / p75 |
 | monitor_meta（仅 monitor 调用） | start_date / end_date / trigger_count / last_update |
 

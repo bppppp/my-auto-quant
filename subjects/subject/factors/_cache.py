@@ -111,24 +111,36 @@ def try_get_cached_factor(col: str, length: int | None = None) -> Optional[pd.Se
             result = df[col].loc[current_date]
             if pd.notna(result):
                 stats["date_hits"] = stats.get("date_hits", 0) + 1
-                # 修复: 日期匹配时也返回与 length 一致的长度
-                # 确保 compute_factors 中所有因子长度一致，避免 Series 比较错误
-                if length is not None and len(df[col]) >= length:
-                    # 返回最后 length 行（包含当前日期的数据）
-                    return df[col].iloc[-length:].reset_index(drop=True)
-                elif length is not None:
-                    # 缓存数据不足 length，返回 None 让调用方走兜底计算
-                    return None
+                # 修复 (P0-1 v3): 日期匹配成功后, 取 current_date 之前的最后 length 行
+                # 而非整个 factor_df 的 iloc[-length:]
+                # 旧 iloc[-length:] 取的是 factor_df 末尾 length 行, 与 current_date 无关,
+                # 当 length < factor_df 长度时, 拿的是 current_date 之后的"未来"数据 (错位)
+                if length is not None:
+                    mask = df.index <= current_date
+                    available = df.loc[mask, col]
+                    if len(available) >= length:
+                        return available.iloc[-length:].reset_index(drop=True)
+                    elif len(available) > 0:
+                        # 缓存数据不足 length, 返回所有可用的 (兜底)
+                        return available.reset_index(drop=True)
+                    else:
+                        return None
                 else:
-                    # 无 length 参数，返回整个缓存
-                    return df[col].reset_index(drop=True)
+                    # 无 length 参数, 返回 current_date 之前的整段
+                    return df.loc[df.index <= current_date, col].reset_index(drop=True)
         except (KeyError, IndexError):
             # 日期不在 index 中，不触发 cache 命中
             pass
 
-    # === Step 2: 位置切片 (回退方式) ===
+    # === Step 2: 位置切片 (回退方式, current_date 失败时) ===
     # 只有当日期精确匹配失败时, 才使用位置切片回退
+    # 修复 (P0-1 v3): 如果有 current_date, 也按 current_date 截取
     series = df[col]
+    if current_date is not None:
+        try:
+            series = df.loc[df.index <= current_date, col]
+        except Exception:
+            pass
 
     # 缓存比请求的更短: 数据缺失, 返回 None
     if length is not None and len(series) < length:
@@ -158,6 +170,20 @@ def try_get_cached_factor(col: str, length: int | None = None) -> Optional[pd.Se
 def get_cache_stats(code: str) -> dict:
     """获取指定股票的缓存统计信息（调试用）."""
     return _cache_stats.get(code, {})
+
+
+def get_aggregate_cache_stats() -> tuple[int, int]:
+    """汇总所有 code 的 date_hits + iloc_hits vs misses.
+
+    Returns:
+        (hits, misses) 累计值。
+    """
+    total_hits = 0
+    total_misses = 0
+    for stats in _cache_stats.values():
+        total_hits += stats.get("date_hits", 0) + stats.get("hits", 0)
+        total_misses += stats.get("misses", 0)
+    return total_hits, total_misses
 
 
 def clear_cache() -> None:

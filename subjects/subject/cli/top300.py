@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+# ===== 预过滤: 仅保留主板/创业板/科创板, 排除退市股和现在 ST 股 =====
+# 60 = 上证主板, 00 = 深证主板/中小板, 30 = 深证创业板, 688 = 上证科创板
+# 不含 8/4 开头 (北交所), 不含 4/9 开头 (老三板退市整理)
+_ALLOWED_CODE_PREFIXES: tuple[str, ...] = ("60", "00", "30", "688")
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
       sys.path.insert(0, str(_PROJECT_ROOT))
@@ -102,6 +107,17 @@ def run_top300_optimize(
           all_codes = BacktestRunner.get_all_stock_codes()
           total_all = len(all_codes)
 
+          # 预过滤: 排除退市股 / 现在 ST 股 / 非主板创业板科创板代码
+          log_print(f"       预过滤: 退市/ST/非主板/创业板/科创板...")
+          all_codes, filter_stats = _filter_eligible_codes(all_codes)
+          log_print(
+              f"       预过滤完成: 总 {filter_stats['total']} → 保留 {filter_stats['kept']} 只"
+              f"  (前缀剔除 {filter_stats['filtered_prefix']},"
+              f"  退市剔除 {filter_stats['filtered_delisted']},"
+              f"  ST 剔除 {filter_stats['filtered_st']},"
+              f"  缺失 {filter_stats['filtered_missing']})"
+          )
+
           # 如果指定了 limit，只取前 limit 只股票进行回测
           if limit:
               all_codes = all_codes[:limit]
@@ -136,8 +152,9 @@ def run_top300_optimize(
           log_print(f"[top300] ========== Top300 结果 ==========")
           top300_list = all_summaries[:300]
           top300_codes = [s.code for s in top300_list]
-          avg_return = sum(s.annual_return for s in top300_list) / 300
-          log_print(f"       平均年化收益率: {avg_return:+.2%}")
+          top_n = len(top300_list)
+          avg_return = sum(s.annual_return for s in top300_list) / top_n if top_n else 0.0
+          log_print(f"       平均年化收益率 (top {top_n}): {avg_return:+.2%}")
           log_print(f"       Top10股票:")
           for i, s in enumerate(top300_list[:10], 1):
               log_print(f"         {i}. {s.code} ({s.name}): {s.annual_return:+.2%}")
@@ -250,6 +267,64 @@ def _optimize_once(name, latest_path, latest_fm, latest_body, max_retries=3) -> 
       write_md(new_path, new_fm, latest_body)
       log_print(f"[top300.optimize] Written: {new_path.name}")
       return new_path
+
+
+def _filter_eligible_codes(codes: list[str]) -> tuple[list[str], dict[str, int]]:
+    """预过滤股票代码: 仅保留主板/创业板/科创板, 排除退市股和现在 ST 股.
+
+    过滤规则 (按顺序短路):
+      1. 6 位代码前缀必须以 60 / 00 / 30 / 688 开头
+      2. 最新一行的 退市时间 必须为空或 "-"
+      3. 最新一行的 是否ST 必须为 "否"
+
+    Returns:
+        (filtered_codes, stats) - stats 含 4 个计数键
+    """
+    import pandas as pd
+    from subject.backtest.data_loader import DATA_ROOT
+
+    stats = {
+        "total": len(codes),
+        "kept": 0,
+        "filtered_prefix": 0,
+        "filtered_delisted": 0,
+        "filtered_st": 0,
+        "filtered_missing": 0,
+    }
+    kept: list[str] = []
+    stock_dir = DATA_ROOT / "data-by-stock"
+
+    for code in codes:
+        code6 = code.split(".")[0]
+        # 规则 1: 前缀
+        if not any(code6.startswith(p) for p in _ALLOWED_CODE_PREFIXES):
+            stats["filtered_prefix"] += 1
+            continue
+        # 规则 2/3: 读最新一行检查退市 & ST
+        f = stock_dir / f"{code6}_金玥数据.csv"
+        if not f.exists():
+            stats["filtered_missing"] += 1
+            continue
+        try:
+            df = pd.read_csv(f, usecols=["是否ST", "退市时间"], encoding="utf-8", low_memory=False)
+        except Exception:
+            stats["filtered_missing"] += 1
+            continue
+        if len(df) == 0:
+            stats["filtered_missing"] += 1
+            continue
+        last = df.iloc[-1]
+        delist_val = str(last.get("退市时间", "")).strip()
+        if delist_val and delist_val not in ("-", "nan", "NaN", "None"):
+            stats["filtered_delisted"] += 1
+            continue
+        if str(last.get("是否ST", "")).strip() == "是":
+            stats["filtered_st"] += 1
+            continue
+        kept.append(code)
+
+    stats["kept"] = len(kept)
+    return kept, stats
 
 
 def _load_optimize_prompt() -> str:

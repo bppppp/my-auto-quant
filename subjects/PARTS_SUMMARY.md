@@ -228,7 +228,7 @@ LLM 翻译 spec 到 `generated/strategy.py` 时，按以下 3 个**检索对象*
 | 熊市识别 | `subject/backtest/bear_market.py` | 沪深 300 20 日跌幅识别 + 仓位折算。 |
 | Runner | `subject/backtest/runner.py` | `BacktestRunner` 主类，统一调度回测流程。**时间范围** (`start_date` / `end_date`) 和 **股票数限制** (`max_stocks`) 都在 runner 内部处理, strategy.py **不感知** (详见 `subject_structure.md` §4.10)。 |
 | 指标 | `subject/backtest/metrics.py` | 7 项指标：年化收益、胜率、盈亏比、夏普、回撤、avg_annual_return_rate、avg_annual_return_amount。 |
-| 信号统计 | `subject/backtest/stats/signal_stats.py` | 每信号 triggered / swallowed / skipped / win_count / win_rate / avg_return / median_holding_days。 |
+| 信号统计 | `subject/backtest/stats/signal_stats.py` | 每信号 triggered / exits / swallowed / skipped / win_count / win_rate / avg_return / median_holding_days。 |
 | 因子值统计 | `subject/backtest/stats/factor_value_stats.py` | 因子值分布：min / max / mean / std / p25 / p50 / p75。 |
 | 报告（params） | `subject/backtest/reports/params_mode.py` | 生成 params 模式报告（MD 格式）。 |
 | 报告（weight） | `subject/backtest/reports/weight_mode.py` | 生成 weight 模式报告（MD 格式，含 signal_attribution）。 |
