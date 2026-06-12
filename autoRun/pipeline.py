@@ -1,7 +1,7 @@
 """
 my-quant3 autoRun 流水线主入口
 
-完整流程: A 生成 → B 翻译 → C params 20 轮 → D 选最优 →
+完整流程: A 生成 → B 翻译 → T top300 筛选 → C params 20 轮 → D 选最优 →
           E weight 20 轮 → F 选最优 → H 导出到 result/ → G 下一策略
 
 Usage:
@@ -10,6 +10,7 @@ Usage:
   python pipeline.py --reset --batch 5 --params-rounds 20 --weight-rounds 20 清空重新来
   python pipeline.py --strategy ma_cross_atr_volume     # 单策略
   python pipeline.py --from-stage B                    # 从某阶段开始
+  python pipeline.py --from-stage T                     # 从 top300 开始 (跳过翻译)
   python pipeline.py --reset                            # 清空 state.json
   python pipeline.py --dry-run                          # 只显示计划
 """
@@ -65,6 +66,7 @@ from autoRun.pipeline.state import (  # noqa: E402
     STAGE_PARAMS_LOOP,
     STAGE_PICKED_PARAMS,
     STAGE_PICKED_WEIGHT,
+    STAGE_TOP300,
     STAGE_TRANSLATED,
     STAGE_WEIGHT_DONE,
     STAGE_WEIGHT_LOOP,
@@ -95,6 +97,87 @@ def _register_subprocess(proc: subprocess.Popen) -> None:
 def _unregister_subprocess(proc: subprocess.Popen) -> None:
     """子进程正常退出后注销."""
     _running_subprocesses.discard(proc)
+
+
+def _cleanup_stray_processes(strategy_name: str = "") -> None:
+    """清理残留的子进程（只清理已完成的，防止误杀正在运行的进程）。
+
+    清理策略：
+    1. 只清理已注册的子进程（通过 Popen.poll() 判断是否已完成）
+    2. 只杀当前 pipeline 主进程的直接子进程（不杀孙进程/兄弟进程）
+    3. 不根据命令行关键词杀进程（避免误杀其他正在运行的策略）
+
+    Args:
+        strategy_name: 当前策略名, 用于日志标记
+    """
+    import subprocess as _subprocess
+
+    log.info(f"    🧹 清理残留进程...")
+
+    # 1. 清理已注册的子进程（只清理已完成的）
+    cleaned = 0
+    for proc in list(_running_subprocesses):
+        try:
+            poll_result = proc.poll()
+            if poll_result is not None:
+                # 进程已结束，安全清理
+                try:
+                    proc.wait(timeout=2)  # 确保完全退出
+                except Exception:
+                    pass
+                _running_subprocesses.discard(proc)
+                cleaned += 1
+                log.info(f"      → 回收已结束进程 pid={proc.pid} (exit={poll_result})")
+            else:
+                # 进程仍在运行，不杀（可能是嵌套调用的子进程）
+                log.info(f"      → 跳过仍在运行的进程 pid={proc.pid}")
+        except Exception:
+            pass
+
+    # 2. 只杀当前 pipeline 主进程的直接子进程（如果进程树中有残留）
+    try:
+        if sys.platform == "win32":
+            current_pid = os.getpid()
+            # 获取所有 python.exe 进程的 PID 和命令行
+            result = _subprocess.run(
+                ["powershell", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\") | "
+                 f"Select-Object ProcessId,ParentProcessId,CommandLine | "
+                 f"ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                import json as _json
+                try:
+                    data = _json.loads(result.stdout)
+                    if isinstance(data, dict):
+                        data = [data]
+                    for proc_info in data:
+                        pid = proc_info.get("ProcessId")
+                        parent_pid = proc_info.get("ParentProcessId")
+                        cmdline = proc_info.get("CommandLine", "") or ""
+                        if pid is None or parent_pid is None:
+                            continue
+                        # 只杀当前进程的直接子进程，且命令行包含 strategy_name 或 pipeline 相关关键词
+                        if parent_pid == current_pid and pid != current_pid:
+                            # 检查是否是 pipeline 相关的进程
+                            if strategy_name and strategy_name in cmdline:
+                                try:
+                                    _subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                                                   capture_output=True, timeout=5)
+                                    log.info(f"      → 已终止残留子进程 pid={pid}")
+                                    cleaned += 1
+                                except Exception:
+                                    pass
+                except (_json.JSONDecodeError, TypeError):
+                    pass
+    except Exception as e:
+        log.warning(f"      ⚠️ 进程清理异常: {e}")
+
+    if cleaned == 0:
+        log.info(f"    🧹 无需清理（无残留进程）")
+    else:
+        log.info(f"    🧹 清理完成 ({cleaned} 个进程)")
 
 
 def _kill_all_subprocesses() -> None:
@@ -282,15 +365,114 @@ def run_stage_b_translate(name: str, config: PipelineConfig) -> Path:
     return result.code_path
 
 
+# ========== Stage T: top300 测试集筛选 ==========
+
+def run_stage_t_top300(name: str, config: PipelineConfig, state: State) -> None:
+    """Stage T: 全量回测筛选最优 300 只股票作为测试集.
+
+    在 strategiesParam/v1.md 存在后调用，调 subject.cli run-top300，
+    结果写入 test_universe/top300.md。
+    后续 Stage C/D/E/F 的回测自动使用这个测试集（subject.cli 会读取它）。
+
+    设计为幂等：若 top300.md 已存在则跳过。
+    """
+    top300_path = subjects_dir() / name / "test_universe" / "top300.md"
+    if top300_path.exists():
+        log.info(f"  → test_universe/top300.md 已存在, 跳过 top300 (幂等)")
+        state.set_stage(name, STAGE_TOP300)
+        state.save()
+        return
+
+    log.info(f"  → top300 筛选 ({config.top300_rounds} 轮, limit={config.top300_limit or '不限'}, timeout={config.top300_timeout or '无限制'}s)")
+    timeout_str = f"{config.top300_timeout}s" if config.top300_timeout else "无限制"
+    cmd = [
+        sys.executable, "-u", "-m", "subject.cli.main",
+        "run-top300",
+        "--strategy", name,
+        "--rounds", str(config.top300_rounds),
+    ]
+    if config.top300_limit is not None:
+        cmd += ["--limit", str(config.top300_limit)]
+    log.info(f"    $ {' '.join(cmd)}  (cwd=subjects/, timeout={timeout_str})")
+
+    import time as _time
+    proc = subprocess.Popen(
+        cmd, cwd=subjects_dir(),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        shell=False, bufsize=1,
+    )
+    _register_subprocess(proc)
+    try:
+        deadline = _time.time() + config.top300_timeout if config.top300_timeout else float("inf")
+        chunks: list[str] = []
+        last_report = _time.time()
+
+        while True:
+            if _time.time() > deadline:
+                log.error(f"    ❌ top300 超时 ({config.top300_timeout}s), 强杀")
+                proc.kill()
+                raise RuntimeError(f"top300 超时 {config.top300_timeout}s")
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line:
+                chunks.append(line)
+                stripped = line.strip()
+                if any(kw in stripped.lower() for kw in ("top300", "round", "回测", "完成", "成功", "失败", "写入", "最优")):
+                    log.info(f"    | {stripped[:200]}")
+            if _time.time() - last_report > 300:
+                log.info(f"    ⏳ top300 仍在跑, pid={proc.pid}")
+                last_report = _time.time()
+            if proc.poll() is not None:
+                if proc.stdout:
+                    rest = proc.stdout.read()
+                    if rest:
+                        chunks.append(rest)
+                break
+            _time.sleep(0.5)
+
+        full = "".join(chunks)
+        my_pid = proc.pid
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        if proc.returncode != 0:
+            log.error(f"    ❌ top300 exit {proc.returncode}, 最后 20 行:")
+            for ln in full.splitlines()[-20:]:
+                log.error(f"        {ln}")
+            raise RuntimeError(f"top300 exit {proc.returncode}")
+        log.info(f"    ✅ top300 完成, 总输出 {len(full)} 字符")
+
+        # 验证 top300.md 是否真的写出来了
+        if not top300_path.exists():
+            raise RuntimeError(f"top300 命令退出 0 但 {top300_path} 未生成")
+        log.info(f"  → top300.md 已写入 ({top300_path})")
+    finally:
+        _unregister_subprocess(proc)
+        _cleanup_stray_processes(name)
+
+    state.set_stage(name, STAGE_TOP300)
+    state.save()
+
+
 # ========== Stage C: params 调优 20 轮 ==========
 
 def run_stage_c_params_loop(name: str, config: PipelineConfig, state: State) -> None:
     """Stage C: params 调优 N 轮."""
     log.info(f"  → params 调优 {config.params_rounds} 轮")
+    # 使用与 smoke test 相同的日期范围
+    start_date = config.smoke_start
+    end_date = config.smoke_end
     for round_n in range(1, config.params_rounds + 1):
         log.info(f"  [params {round_n}/{config.params_rounds}]")
         try:
-            run_backtest(name, mode="params", timeout=config.backtest_timeout)
+            run_backtest(name, mode="params", timeout=config.backtest_timeout,
+                         start_date=start_date, end_date=end_date)
             metrics = parse_latest(name, mode="params")
             if metrics:
                 state.record_params(name, round_n, metrics)
@@ -363,10 +545,14 @@ def run_stage_e_weight_loop(name: str, config: PipelineConfig, state: State) -> 
         log.warning(f"  ⚠️ weight_v1.md 不存在, 回退到 Stage D (重新复制 best params)")
         run_stage_d_pick_best_params(name, config, state)
     log.info(f"  → weight 调优 {config.weight_rounds} 轮 (v1 是 best params 副本)")
+    # 使用与 smoke test 相同的日期范围
+    start_date = config.smoke_start
+    end_date = config.smoke_end
     for round_n in range(1, config.weight_rounds + 1):
         log.info(f"  [weight {round_n}/{config.weight_rounds}]")
         try:
-            run_backtest(name, mode="weight", timeout=config.backtest_timeout)
+            run_backtest(name, mode="weight", timeout=config.backtest_timeout,
+                         start_date=start_date, end_date=end_date)
             metrics = parse_latest(name, mode="weight")
             if metrics:
                 state.record_weight(name, round_n, metrics)
@@ -472,7 +658,7 @@ def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> Non
                 # 关键行实时打印
                 if any(kw in stripped.lower() for kw in ("loading", "optimize", "factor", "weight", "tune", "generate", "完成", "成功", "失败", "参数", "周期", "策略")):
                     log.info(f"    | {stripped[:200]}")
-            if _time.time() - last_report > 60:
+            if _time.time() - last_report > 300:
                 log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}")
                 last_report = _time.time()
             if proc.poll() is not None:
@@ -506,13 +692,17 @@ def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> Non
         log.info(f"    ✅ {subcommand} 完成, 总输出 {len(full)} 字符")
     finally:
         _unregister_subprocess(proc)
+        _cleanup_stray_processes()  # 清理残留进程
 
 
-def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
+def run_backtest(name: str, mode: str, timeout: int | None = 1800,
+                 start_date: str | None = None, end_date: str | None = None) -> None:
     """调 subject.cli run 跑 backtest, 实时输出 stdout 到 log (避免长时间 subprocess 看不到 progress).
 
     Args:
         timeout: 子进程超时秒数,None 表示不设超时.
+        start_date: 起始日期 (YYYY-MM-DD), 默认 None (使用回测引擎默认 5 年).
+        end_date: 结束日期 (YYYY-MM-DD), 默认 None (使用数据末日).
     """
     import time as _time
     cmd = [
@@ -523,6 +713,11 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
     ]
     if mode == "weight":
         cmd += ["--weight-test", name]
+    # 传递日期范围，与 smoke test 保持一致
+    if start_date:
+        cmd += ["--start-date", start_date]
+    if end_date:
+        cmd += ["--end-date", end_date]
     timeout_str = f"{timeout}s" if timeout is not None else "无限制"
     log.info(f"    $ {' '.join(cmd)} (cwd=subjects/, timeout={timeout_str})")
 
@@ -555,8 +750,8 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
                 if any(kw in stripped.lower() for kw in ("loading", "backtest", "factor", "weight", "computing", "running", "完成", "report", "策略", "周期", "交易", "回测", "因子", "stock", "done", "%")):
                     log.info(f"    | {stripped[:200]}")
 
-            # 60 秒无新输出就报告 (即使没关键行, 也告诉用户"还在跑")
-            if _time.time() - last_progress_report > 60:
+            # 5 分钟无新输出才报告 (减少日志量)
+            if _time.time() - last_progress_report > 300:
                 log.info(f"    ⏳ backtest 仍在跑, pid={proc.pid}, 已 {_time.time() - (deadline - timeout):.0f}s")
                 last_progress_report = _time.time()
 
@@ -595,6 +790,7 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800) -> None:
         log.info(f"    ✅ backtest 完成, exit=0, 总输出 {len(full_output)} 字符")
     finally:
         _unregister_subprocess(proc)
+        _cleanup_stray_processes(name)  # 清理残留进程
 
 
 def parse_latest(name: str, mode: str) -> dict:
@@ -605,7 +801,7 @@ def parse_latest(name: str, mode: str) -> dict:
 
 # ========== 主循环 ==========
 
-STAGE_ORDER = ["A", "B", "C", "D", "E", "F", "H"]
+STAGE_ORDER = ["A", "B", "T", "C", "D", "E", "F", "H"]
 
 
 def main_loop(args, config: PipelineConfig) -> int:
@@ -622,7 +818,12 @@ def main_loop(args, config: PipelineConfig) -> int:
         # 决定本轮策略
         if args.strategy:
             strategy_name = args.strategy
-            start_stage = args.from_stage or "A"
+            # 从 state 恢复当前阶段（支持断点续跑）
+            rec = state.get(strategy_name)
+            if rec.stage in (STAGE_EXPORTED, STAGE_FAILED):
+                log.info(f"策略 {strategy_name} 已完成({rec.stage}), 跳过")
+                continue  # 跳过, batch_count 不增加, 等待下一策略或退出
+            start_stage = current_stage_letter(rec.stage)
         elif state.has_pending():
             strategy_name = state.current_strategy or next_pending(state)
             start_stage = current_stage_letter(state.get(strategy_name).stage)
@@ -683,6 +884,8 @@ def run_one_stage(stage: str, name: str, config: PipelineConfig, state: State) -
     elif stage == "B":
         run_stage_b_translate(name, config)
         state.set_stage(name, STAGE_TRANSLATED)
+    elif stage == "T":
+        run_stage_t_top300(name, config, state)
     elif stage == "C":
         run_stage_c_params_loop(name, config, state)
     elif stage == "D":
@@ -708,7 +911,8 @@ def current_stage_letter(stage: str) -> str:
     mapping = {
         "init": "A",
         "generated": "B",
-        "translated": "C",
+        "translated": "T",    # B 完成后进入 top300 筛选
+        "top300": "C",        # top300 完成后进入 params 调优
         "params_loop": "C",
         "params_done": "D",
         "picked_params": "E",
@@ -810,7 +1014,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 默认 (无子命令) 跑流水线
     parser.add_argument("--batch", type=int, default=None, help="一次跑几个策略 (覆盖 config)")
     parser.add_argument("--strategy", default=None, help="只跑指定策略")
-    parser.add_argument("--from-stage", default=None, choices=["A", "B", "C", "D", "E", "F", "H"], help="从某阶段开始")
+    parser.add_argument("--from-stage", default=None, choices=["A", "B", "T", "C", "D", "E", "F", "H"], help="从某阶段开始")
     parser.add_argument("--params-rounds", type=int, default=None, help="params 调优轮数 (覆盖 config)")
     parser.add_argument("--weight-rounds", type=int, default=None, help="weight 调优轮数 (覆盖 config)")
     parser.add_argument("--translate-max", type=int, default=None, help="翻译重试上限 (覆盖 config)")
@@ -823,6 +1027,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cli-timeout", type=int, default=None, help="optimize/factor_weights timeout (秒, 默认 1800/30m, 0=禁用)")
     parser.add_argument("--backtest-timeout", type=int, default=None, help="单次回测 timeout (秒, 默认 3600/1h, 0=禁用)")
     parser.add_argument("--smoke-timeout", type=int, default=None, help="翻译 smoke backtest timeout (秒, 默认 600/10m)")
+    parser.add_argument("--top300-timeout", type=int, default=None, help="top300 每轮 timeout (秒, 默认 14400/4h, 0=禁用)")
+    parser.add_argument("--top300-rounds", type=int, default=None, help="top300 调优轮数 (默认 3)")
+    parser.add_argument("--top300-limit", type=int, default=None, help="top300 每轮最多测 N 只股票 (默认不限, 调试建议 50-100)")
 
     # check-env 子命令
     sub.add_parser("check-env", help="检查环境是否就绪")
@@ -856,6 +1063,12 @@ def main(argv: list[str] | None = None) -> int:
         overrides["backtest_timeout"] = args.backtest_timeout if args.backtest_timeout > 0 else None
     if args.smoke_timeout is not None:
         overrides["smoke_timeout"] = args.smoke_timeout
+    if args.top300_timeout is not None:
+        overrides["top300_timeout"] = args.top300_timeout if args.top300_timeout > 0 else None
+    if args.top300_rounds is not None:
+        overrides["top300_rounds"] = args.top300_rounds
+    if args.top300_limit is not None:
+        overrides["top300_limit"] = args.top300_limit
     config = PipelineConfig(**overrides) if overrides else PipelineConfig()
 
     if args.dry_run:
@@ -877,6 +1090,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  cli_timeout:         {_fmt(config.cli_timeout)}")
         print(f"  backtest_timeout:    {_fmt(config.backtest_timeout)}")
         print(f"  smoke_timeout:       {_fmt(config.smoke_timeout)}")
+        print(f"  top300_rounds:      {config.top300_rounds} 轮")
+        print(f"  top300_limit:      {config.top300_limit or '不限'}")
+        print(f"  top300_timeout:     {_fmt(config.top300_timeout)}")
         return 0
 
     banner("my-quant3 pipeline 启动", char="=")

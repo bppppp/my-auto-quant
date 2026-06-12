@@ -12,7 +12,9 @@ pipeline.translator — Spec → strategy.py 翻译器
 """
 from __future__ import annotations
 
+import os
 import re
+import select
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -281,12 +283,12 @@ def invoke_claude_fix(code_path: Path, spec_path: Path, feedback: str) -> bool:
 ## 修复步骤
 1. Read {code_path} (strategy.py)
 2. Read {spec_path} (YAML spec)
-3. Read D:/project/quant/my-quant3/subjects/subject_structure.md (3 方法契约)
+3. Read {project_root()}/subjects/subject_structure.md (3 方法契约)
 4. 诊断 bug
 5. Edit strategy.py 修复
 6. 跑 smoke backtest 验证:
    ```
-   cd D:/project/quant/my-quant3/subjects
+   cd "{project_root()}/subjects"
    python {code_path.parent.parent.name}/generated/strategy.py \\
      --start-date 2024-06-01 --end-date 2024-06-30 \\
      --test-universe 000001.SZ,000002.SZ,600000.SH,600519.SH,000333.SZ \\
@@ -332,7 +334,7 @@ def _run_claude_promote_review(
 你刚帮 `{name}` 生成了 strategy.py。现在做一个**独立 review**:
 
 1. **Read** `{code_path}` (strategy.py)
-2. **Read** `D:/project/quant/my-quant3/subjects/PARTS_SUMMARY.md` (公共库白名单)
+2. **Read** `{project_root()}/subjects/PARTS_SUMMARY.md` (公共库白名单)
 3. **Read** `{spec_path}` (策略 spec)
 4. **扫描 strategy.py**:
    - 找 `pd.Series.rolling` / `pd.DataFrame.rolling` / `df[...].rolling` / `df.rolling` / `shift` / `pct_change` / `diff` 等手写调用
@@ -404,7 +406,7 @@ def _run_claude_promote_review(
             line = proc.stdout.readline() if proc.stdout else ""
             if line:
                 chunks.append(line)
-            if _time.time() - last_report > 60:
+            if _time.time() - last_report > 300:
                 log.info(f"  ⏳ Claude review 仍在跑 ...")
                 last_report = _time.time()
             if proc.poll() is not None:
@@ -509,10 +511,10 @@ def _run_claude_generate_or_fix(
 你正在 my-quant3 项目中工作。需要根据 spec 生成一份可运行的 `generated/strategy.py`。
 
 ## 必读文件 (顺序)
-1. `D:/project/quant/my-quant3/subjects/PARTS_SUMMARY.md` — **公共库白名单, 严禁 import 列表外的函数**
-2. `D:/project/quant/my-quant3/subjects/subject_structure.md` — 3 方法契约 + 数据列名 + position 字段
-3. `D:/project/quant/my-quant3/subjects/{name}/{name}_original.md` — 策略 spec (YAML + body)
-4. `D:/project/quant/my-quant3/autoRun/pipeline/prompts/translate.md` — 翻译规则 (硬要求)
+1. `{project_root()}/subjects/PARTS_SUMMARY.md` — **公共库白名单, 严禁 import 列表外的函数**
+2. `{project_root()}/subjects/subject_structure.md` — 3 方法契约 + 数据列名 + position 字段
+3. `{project_root()}/subjects/{name}/{name}_original.md` — 策略 spec (YAML + body)
+4. `{project_root()}/autoRun/pipeline/prompts/translate.md` — 翻译规则 (硬要求)
 
 ## 目标文件
 - `{code_path}` (strategy.py) — 如果已存在, 完整覆盖
@@ -535,7 +537,7 @@ def _run_claude_generate_or_fix(
 ## 完成后
 1. 跑 smoke 验证 (5 股, 1 个月):
    ```
-   cd "D:/project/quant/my-quant3/subjects"
+   cd "{project_root()}/subjects"
    python {name}/generated/strategy.py --start-date {smoke_start} --end-date {smoke_end} --test-universe {",".join(smoke_universe)} --max-stocks 5
    ```
 2. 退码 0 且 `subjects/{name}/reportParams/report_v1.md` 存在 → **成功了**, 输出 `[DONE] success`
@@ -585,8 +587,8 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
 ## 文件
 - strategy.py: `{code_path}` (请 Read 它)
 - spec: `{spec_path}` (请 Read 它)
-- 公共库: `D:/project/quant/my-quant3/subjects/PARTS_SUMMARY.md`
-- 契约: `D:/project/quant/my-quant3/subjects/subject_structure.md`
+- 公共库: `{project_root()}/subjects/PARTS_SUMMARY.md`
+- 契约: `{project_root()}/subjects/subject_structure.md`
 
 ## 上次失败信息
 ```
@@ -599,7 +601,7 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
 3. Edit 修复
 4. 跑 smoke:
    ```
-   cd "D:/project/quant/my-quant3/subjects"
+   cd "{project_root()}/subjects"
    python {name}/generated/strategy.py --start-date {smoke_start} --end-date {smoke_end} --test-universe {",".join(smoke_universe)} --max-stocks 5
    ```
 5. 退码 0 + reportParams/report_v1.md 存在 → 修好了, 结束
@@ -636,7 +638,7 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
             )
             log.info(f"  → Claude 进程启动, pid={proc.pid}")
 
-            # 实时监控循环: 监控文件 mtime + 进程存活, 不依赖 stdout (claude -p 不 flush)
+            # 实时监控循环: 监控文件 mtime + 进程存活 + select 读 stdout
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
             last_size = -1
@@ -645,8 +647,8 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
             hard_deadline = _time.time() + 900  # 15 分钟
             inactivity_timeout = 180  # 3 分钟文件无变化 → 卡死警告
             max_inactivity_before_kill = 600  # 10 分钟无变化 → 强杀
+            process_start_time = _time.time()
 
-            import os
             code_dir = code_path.parent
             code_dir.mkdir(parents=True, exist_ok=True)
 
@@ -668,11 +670,12 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
                         last_size = sz
                         last_mtime_change = _time.time()
 
-                # 30 秒一次进度报告 (即使没变化也告诉用户"还在等")
-                if _time.time() - last_progress_report > 30:
+                # 5 分钟一次进度报告 (减少日志量)
+                if _time.time() - last_progress_report > 300:
                     idle = _time.time() - last_mtime_change
+                    elapsed = _time.time() - process_start_time
                     if proc.poll() is None:
-                        log.info(f"  ⏳ Claude 仍在工作... strategy.py={last_size} 字节, 文件 {int(idle)}s 未变化, 已运行 {int(_time.time() - (_time.time() - 300))}s")
+                        log.info(f"  ⏳ Claude 仍在工作... strategy.py={last_size} 字节, 文件 {int(idle)}s 未变化, 已运行 {int(elapsed)}s")
                     last_progress_report = _time.time()
 
                 # inactivity 检测
@@ -687,28 +690,63 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
                 elif idle > inactivity_timeout and last_size < 1000:
                     log.warning(f"  ⚠️ strategy.py 已 {int(idle)}s 无变化 (size={last_size}), 继续等...")
 
+                # select 非阻塞读 stdout/stderr (实时收集输出, 供后面解析 [DONE]/[FAILED] 使用)
+                if proc.stdout is not None:
+                    try:
+                        readable, _, _ = select.select([proc.stdout], [], [], 0.1)
+                        if readable:
+                            chunk = os.read(proc.stdout.fileno(), 4096).decode("utf-8", errors="replace")
+                            if chunk:
+                                stdout_chunks.append(chunk)
+                    except OSError:
+                        pass
+                if proc.stderr is not None:
+                    try:
+                        _, readable, _ = select.select([], [proc.stderr], [], 0.1)
+                        if readable:
+                            chunk = os.read(proc.stderr.fileno(), 4096).decode("utf-8", errors="replace")
+                            if chunk:
+                                stderr_chunks.append(chunk)
+                    except OSError:
+                        pass
+
                 # 检查进程退出
                 if proc.poll() is not None:
                     log.info(f"  → Claude 进程退出, exit={proc.returncode}")
+                    # 退出后把剩余输出全部读完
+                    if proc.stdout is not None:
+                        try:
+                            remaining = os.read(proc.stdout.fileno(), 65536).decode("utf-8", errors="replace")
+                            if remaining:
+                                stdout_chunks.append(remaining)
+                        except OSError:
+                            pass
+                    if proc.stderr is not None:
+                        try:
+                            remaining = os.read(proc.stderr.fileno(), 65536).decode("utf-8", errors="replace")
+                            if remaining:
+                                stderr_chunks.append(remaining)
+                        except OSError:
+                            pass
                     break
 
-                _time.sleep(1.0)
+                _time.sleep(0.5)
 
-            # 进程退出后, 读完剩余 stdout/stderr
+            # 进程已退出, 安全关闭管道并 wait
             try:
-                if proc.stdout:
-                    proc.stdout.close()
-                if proc.stderr:
-                    proc.stderr.close()
                 proc.wait(timeout=10)
             except Exception:
                 pass
-
-            # 重读完整输出 (subprocess.run 替代, 因为 Popen 没读完)
             try:
-                full_stdout, full_stderr = proc.communicate(timeout=30)
+                if proc.stdout:
+                    proc.stdout.close()
             except Exception:
-                full_stdout, full_stderr = "", ""
+                pass
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
+            except Exception:
+                pass
 
             full_stdout = "".join(stdout_chunks)
             full_stderr = "".join(stderr_chunks)

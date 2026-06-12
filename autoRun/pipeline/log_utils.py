@@ -53,18 +53,59 @@ def get_logger(name: str = "pipeline") -> logging.Logger:
     logger.addHandler(file_handler)
 
     # 实时 flush: FileHandler 换成行缓冲 subclass, 避免长 subprocess 期间看不到日志
-    class _LineBufferedFileHandler(logging.FileHandler):
+    # 日志文件大小限制 (50MB)，超过则轮转
+    MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
+
+    class _RotatingFileHandler(logging.FileHandler):
+        """带大小限制的文件 handler，超过阈值则轮转（重命名为 .1, .2, ...）"""
         def emit(self, record):
-            super().emit(record)
             try:
+                self._maybe_rotate()
+                super().emit(record)
                 self.flush()
             except Exception:
                 pass
 
-    # 把刚才加的 file_handler 替换为行缓冲版本
-    logger.removeHandler(file_handler)
-    file_handler.close()
-    file_handler = _LineBufferedFileHandler(log_file, encoding="utf-8")
+        def _maybe_rotate(self):
+            if self.baseFilename and os.path.exists(self.baseFilename):
+                try:
+                    size = os.path.getsize(self.baseFilename)
+                    if size >= self.MAX_LOG_SIZE:
+                        self._rotate_log()
+                except Exception:
+                    pass
+
+        def _rotate_log(self):
+            """轮转日志文件，最多保留 3 份备份"""
+            base = self.baseFilename
+            for i in range(3, 0, -1):
+                old = f"{base}.{i}"
+                new = f"{base}.{i + 1}" if i < 3 else None
+                if os.path.exists(old):
+                    if new:
+                        try:
+                            os.rename(old, new)
+                        except Exception:
+                            try:
+                                os.unlink(old)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            os.unlink(old)
+                        except Exception:
+                            pass
+            # 重命名当前日志为 .1
+            try:
+                os.rename(base, f"{base}.1")
+            except Exception:
+                pass
+            # 重新打开文件
+            self.close()
+            self.stream = None
+            self._open()
+
+    file_handler = _RotatingFileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     logger.addHandler(file_handler)
 

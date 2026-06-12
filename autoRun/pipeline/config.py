@@ -66,6 +66,12 @@ class PipelineConfig:
     # 翻译阶段 smoke backtest (5 只股票, 1 个月)
     smoke_timeout: int = 600                  # 10 分钟
 
+    # Stage T (top300) 全量回测筛选 (全量股票 × 5 年 × rounds 轮)
+    # 每轮耗时约 1-4 小时, None 表示不设超时 (依赖 Ctrl+C)
+    top300_timeout: int | None = 14400        # 4 小时 (默认每轮上限)
+    top300_rounds: int = 1                   # 调优轮数 (每轮 LLM 调参 + 全量回测)
+    top300_limit: int | None = None          # 每轮最多测 N 只股票 (None=不限/全量, 调试建议设 50-100)
+
     # 路径 (相对项目根, 可被 CLI 覆盖)
     result_dir: Path = field(default=None)  # type: ignore
 
