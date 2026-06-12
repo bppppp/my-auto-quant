@@ -367,6 +367,42 @@ def run_stage_b_translate(name: str, config: PipelineConfig) -> Path:
 
 # ========== Stage T: top300 测试集筛选 ==========
 
+def _compute_top300_date_range(lookback_years: int) -> tuple[str | None, str | None]:
+    """从 data-by-day/ 扫出 end_date, start = end - lookback_years*365 天.
+
+    复用 BacktestRunner._apply_default_date_range_5y 的扫描逻辑 (按年目录 + 文件名
+    YYYY-MM-DD_金玥数据.csv 提取日期), 但 years 由调用方控制. 拿不到日期时返回
+    (None, None), 让 runner 走 5y 默认.
+
+    Args:
+        lookback_years: 回看年数 (>= 1)
+
+    Returns:
+        (start_date, end_date) 字符串 YYYY-MM-DD, 或 (None, None)
+    """
+    if lookback_years < 1:
+        return None, None
+    root = project_root() / "data" / "data-by-day"
+    if not root.exists():
+        return None, None
+    all_dates: list[str] = []
+    for year_dir in sorted(root.iterdir()):
+        if not year_dir.is_dir():
+            continue
+        year = year_dir.name
+        for f in year_dir.iterdir():
+            if f.suffix == ".csv" and f.stem.startswith(f"{year}-"):
+                all_dates.append(f.stem.split("_")[0])
+    if not all_dates:
+        return None, None
+    all_dates.sort()
+    end_str = all_dates[-1]
+    import pandas as _pd  # 局部导入, 避免顶层强依赖
+    end_ts = _pd.Timestamp(end_str)
+    start_ts = end_ts - _pd.Timedelta(days=365 * lookback_years)
+    return start_ts.strftime("%Y-%m-%d"), end_str
+
+
 def run_stage_t_top300(name: str, config: PipelineConfig, state: State) -> None:
     """Stage T: 全量回测筛选最优 300 只股票作为测试集.
 
@@ -383,6 +419,19 @@ def run_stage_t_top300(name: str, config: PipelineConfig, state: State) -> None:
         state.save()
         return
 
+    # 计算滚动窗口: 以 data-by-day 末日为 end, start = end - lookback_years 年
+    start_date, end_date = _compute_top300_date_range(config.top300_lookback_years)
+    if start_date and end_date:
+        log.info(
+            f"  → top300 窗口: {start_date} ~ {end_date} "
+            f"(data 末日往前推 {config.top300_lookback_years} 年, 覆盖 runner 默认 5y)"
+        )
+    else:
+        log.warning(
+            f"  ⚠️ 无法从 data-by-day/ 推算日期窗口, "
+            f"回退到 runner 5y 默认 (start={start_date}, end={end_date})"
+        )
+
     log.info(f"  → top300 筛选 ({config.top300_rounds} 轮, limit={config.top300_limit or '不限'}, timeout={config.top300_timeout or '无限制'}s)")
     timeout_str = f"{config.top300_timeout}s" if config.top300_timeout else "无限制"
     cmd = [
@@ -393,6 +442,10 @@ def run_stage_t_top300(name: str, config: PipelineConfig, state: State) -> None:
     ]
     if config.top300_limit is not None:
         cmd += ["--limit", str(config.top300_limit)]
+    if start_date:
+        cmd += ["--start-date", start_date]
+    if end_date:
+        cmd += ["--end-date", end_date]
     log.info(f"    $ {' '.join(cmd)}  (cwd=subjects/, timeout={timeout_str})")
 
     import time as _time
@@ -1030,6 +1083,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top300-timeout", type=int, default=None, help="top300 每轮 timeout (秒, 默认 14400/4h, 0=禁用)")
     parser.add_argument("--top300-rounds", type=int, default=None, help="top300 调优轮数 (默认 3)")
     parser.add_argument("--top300-limit", type=int, default=None, help="top300 每轮最多测 N 只股票 (默认不限, 调试建议 50-100)")
+    parser.add_argument("--top300-lookback-years", type=int, default=None,
+                        help="top300 滚动回看年数 (默认 2, 覆盖 runner 5y 默认; 以 data-by-day 末日为 end 往前推)")
 
     # check-env 子命令
     sub.add_parser("check-env", help="检查环境是否就绪")
@@ -1069,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
         overrides["top300_rounds"] = args.top300_rounds
     if args.top300_limit is not None:
         overrides["top300_limit"] = args.top300_limit
+    if args.top300_lookback_years is not None:
+        overrides["top300_lookback_years"] = args.top300_lookback_years
     config = PipelineConfig(**overrides) if overrides else PipelineConfig()
 
     if args.dry_run:
@@ -1093,6 +1150,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  top300_rounds:      {config.top300_rounds} 轮")
         print(f"  top300_limit:      {config.top300_limit or '不限'}")
         print(f"  top300_timeout:     {_fmt(config.top300_timeout)}")
+        print(f"  top300_lookback_years: {config.top300_lookback_years} 年")
+        # 实际跑时 start/end 由 _compute_top300_date_range 算, 这里也展示一份方便对照
+        s, e = _compute_top300_date_range(config.top300_lookback_years)
+        if s and e:
+            print(f"  top300 日期范围:    {s} ~ {e}  (data 末日往前推 {config.top300_lookback_years} 年)")
+        else:
+            print(f"  top300 日期范围:    (无法从 data-by-day/ 推算, 走 runner 5y 默认)")
         return 0
 
     banner("my-quant3 pipeline 启动", char="=")
