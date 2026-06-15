@@ -1,8 +1,8 @@
 # 本地 Weight 回测引擎 → 聚宽脚本对接规范
 
-> **目的**: 当一个新策略从本地 weight 模式 (`subjects/subject/backtest/runner.py::_run_weight`) 翻译到聚宽脚本时, 本文档提供逐项对照规则, 避免回测结果出现巨大差距 (>10%) 的常见陷阱.
+> **目的**: 当一个新策略从本地 weight 模式 (`subjects/subject/backtest/runner.py::_run_weight`) 翻译到聚宽脚本时, 本文档提供逐项对照规则, 避免回测结果出现巨大差距的常见陷阱.
 >
-> **参照实现**: `joinQuant/trend_momentum_strategy_1.py` 是已对齐过的标杆.
+> **适用范围**: 任何从本地 weight 引擎迁移到聚宽回测的策略. 本文档只描述**对接规范**, 不绑定具体策略/因子/参数.
 
 ---
 
@@ -10,7 +10,7 @@
 
 > **T-1 严格无前视 + 单一组合管理 + score 加权选股 + 5 个仓位约束链式应用 + 出场每天检查 + 入场只在调仓日**
 
-如果聚宽脚本与本地回测的 `annual_return` / `total_return` 差距 > **5%**, 请**逐项**对照本文档的 9 个章节排查.
+如果聚宽脚本与本地回测的 `annual_return` / `total_return` 差距 > **5%**, 请**逐项**对照本文档的章节排查.
 
 ---
 
@@ -74,7 +74,13 @@ run_daily(execute_pending, time="09:30")     # 次日开盘成交
 |---|---|---|
 | 1 (首日) | `continue`, 只记 daily_value | `return`, 不做任何交易 |
 | 2,3,4 | 仅出场检查, 不调仓 | 同左 |
-| 5,10,15,... | 出场 + 调仓 (`bar_idx % freq == 0`) | 同左 |
+| freq, 2×freq, ... | 出场 + 调仓 (`bar_idx % freq == 0`) | 同左 |
+
+**关键事实** (2026-06 更新, 修正 `should_rebalance` docstring 的错误描述):
+- 本地 runner.py 用 `for bar_idx, date_str in enumerate(trading_dates, 1)` → **bar_idx 是 1-based** (1, 2, 3, ...)
+- `if bar_idx == 1: continue` 跳过首日 (没有 T-1 数据)
+- `should_rebalance(bar_idx, freq)` 触发条件 `bar_idx % freq == 0`, freq=5 时首次 rebalance 在 bar_idx=5
+- ⚠️ `subjects/subject/backtest/portfolio.py:should_rebalance` 的 docstring 写"0-based, 0,5,10..."是**误导**, 实际 runner 传的是 1-based, 触发点为 5, 10, 15, ...
 
 ```python
 def should_rebalance(bar_index, freq):
@@ -157,7 +163,44 @@ def entry_score(factors, p):
     return score
 ```
 
-如果策略只有 1 个入场信号 (如 trend_momentum_entry, weight=1.0), 则 score ∈ {0, 1.0}, **所有候选 score 相同, 必须靠 seed shuffle 选股**.
+### 2.5 ⚠️ 高坑: scores 必须含**所有股票**(包括持仓), 不要过滤持仓
+
+**本地** `runner.py`:
+```python
+for code, row in day_data.items():      # ← 遍历所有股票
+    ...
+    scores[code] = score                  # ← 不论是否持仓, 都算 score
+```
+
+**错误实现**(会让调仓日"卖光所有持仓"):
+```python
+scores = {}
+for stock, f in factors_by_code.items():
+    if stock not in g.holdings:           # ← 这行是 bug
+        s = entry_score(f, p)
+        if s > 0:
+            scores[stock] = s
+```
+
+**为什么是高坑?**
+- `scores` 里少了持仓 → `rank_top_n` 选的 top N 全是新候选
+- `target_weights` 全部都是新候选 → 卖出块的 `if stock in target_weights: continue` 永远不命中
+- → 调仓日**所有持仓被无差别卖出**, 违背"留赢家, 卖输家"的核心意图
+
+**正确实现**:
+```python
+scores = {}
+for stock, f in factors_by_code.items():
+    s = entry_score(f, p)
+    if s > 0:
+        scores[stock] = s
+# 不过滤持仓. 持仓股在 universe 中, 会自动进入 scores.
+# 持仓不在 universe 时 (罕见), 单独 fallback 补算后加入 scores.
+```
+
+**buy 块已经有 `if stock in g.holdings: continue` 保护**, 所以保留持仓股的 score 不会导致"重复买".
+
+如果策略只有 1 个入场信号 (weight = 1.0), 则 score ∈ {0, 1.0}, **所有候选 score 相同, 必须靠 seed shuffle 选股**.
 
 ---
 
@@ -203,25 +246,45 @@ def should_exit(factors, holding, current_price, p):
     return None
 ```
 
-**真相**: 即使某个出场信号 `weight = 1e-8` (看起来像"禁用"), **它仍然会被检查并可能触发**.
+**真相**: 即使某个出场信号 `weight` 非常小 (例如 `1e-8`), **它仍然会被检查并可能触发**, 仅排在优先级最末.
 
-**示例**: `trend_reversal` (ma_5 < ma_20) 在很多股票上几乎每天成立, 即使 weight=1e-8, 每天都会大量触发出场.
+### 3.2.1 ✅ 正确实现: 任何 `weight > 0` 的信号都参与触发
 
-### 3.3 出场信号优先级 (典型趋势策略示例)
+按 weight 降序遍历, **第一个满足触发条件的信号就出场**; `weight == 0` 才是真正禁用.
 
-| 信号 | 典型 weight | 触发条件 |
-|---|---|---|
-| rsi_overbought_stop | 3.0 | rsi_14 > 84 (超买止盈) |
-| trailing_stop | 0.5 | current_price < highest × (1 - 15%) |
-| time_stop | 0.3 | holding_days >= 75 |
-| trend_reversal | 1e-8 | ma_5 < ma_20 (**会频繁触发!**) |
-| fixed_stop | 1e-8 | current_price < entry × 0.87 |
+**实现**:
+```python
+def should_exit(factors, holding, current_price, p):
+    exit_w = p["exit_weights"]
+    # weight == 0 才是真正"禁用"; 任何 weight > 0 的信号都参与触发, 仅按优先级排序
+    active_sigs = [s for s, w in exit_w.items() if w > 0]
+    for sig in sorted(active_sigs, key=exit_w.get, reverse=True):
+        if _check_exit_signal(sig, factors, holding, current_price, p):
+            return sig
+    return None
+```
 
-> 如果想**真正禁用**某个信号, 必须把它从 `exit_weights` 中删除, **不要靠设小 weight**.
+> **.final.md 与脚本必须一致**: spec 里把某信号 weight 调到极小 (如 `1e-8`),
+> 脚本 `should_exit` 必须保留该信号 (仅排在最末), 触发条件成立时仍会平仓.
+> **weight 仅决定优先级, 不决定是否启用**.
+
+### 3.3 出场信号优先级 (通用示例)
+
+| 信号 | 典型 weight 量级 | 触发条件 | 备注 |
+|---|---|---|---|
+| 优先级最高 | 高 (e.g. 1.0+) | 由 spec 定义 | 最先检查 |
+| 普通优先级 | 中 (e.g. 0.3~1.0) | 由 spec 定义 | |
+| 最低优先级 | 极小 (e.g. 1e-8) | 由 spec 定义 | **仍会触发, 仅兜底** |
+
+> 如果想**真正禁用**某个信号, 二选一:
+> 1. 将其 `weight` 设为 `0` (`should_exit` 跳过 `weight == 0` 的信号, 保留 spec 原值便于追溯)
+> 2. 直接从 `exit_weights` 中删除该键 (暴力, 改动 spec)
+>
+> **不要靠极小 weight (如 `1e-8`) 实现禁用**: 极小 weight 仅表示"低优先级", 触发条件成立时仍会平仓.
 
 ### 3.4 持仓不在 universe 时的处理
 
-策略文档要求"所有持仓都要走出场决策", 即使股票被剔出 HS300 也要继续监控:
+策略文档要求"所有持仓都要走出场决策", 即使股票被剔出 universe 也要继续监控:
 
 ```python
 # step 3: 算因子时, 给持仓股单独算 (universe 中可能没有)
@@ -271,9 +334,11 @@ def enforce_max_single_weight(weights, max_pct):
         else:
             for k in out:
                 out[k] = max_pct
-    # 归一化到总和 = 1
+    # ⚠️ 仅当 sum > 1 + epsilon (overweight) 时 re-normalize;
+    #    sum < 1 (underweight) 时保留, 由 fill_cash 补齐.
+    #    错误实现 `if abs(s-1) > epsilon` 会让 cap 失效.
     s = sum(out.values())
-    if s > 0 and abs(s - 1.0) > 1e-6:
+    if s > 1.0 + 1e-6:
         out = {k: v / s for k, v in out.items()}
     return out
 ```
@@ -300,17 +365,17 @@ def enforce_industry_concentration(weights, industry_map, max_pct):
         out[code] = w * scale[ind]
         if scale[ind] < 1.0:
             any_scaled = True
-    # 只有真正缩放过才归一化
+    # ⚠️ 仅当 sum > 1 + epsilon 时 re-normalize; sum < 1 时保留 (fill_cash 补).
     if any_scaled:
         s = sum(out.values())
-        if s > 0 and abs(s - 1.0) > 1e-6:
+        if s > 1.0 + 1e-6:
             out = {k: v / s for k, v in out.items()}
     return out
 ```
 
 ### 4.4 ⚠️ 行业映射必须用历史快照, 不是当前快照
 
-**本地**: `load_industry_map(universe, date_str)` 从 `data-by-day/{date}.csv` 读历史快照.
+**本地**: `load_industry_map(universe, date_str)` 从历史的当日横截面读历史快照.
 
 **聚宽对应**:
 ```python
@@ -325,7 +390,7 @@ def get_industry_map(stock_list, date=None):
 g.industry_map = get_industry_map(g.universe, date=context.previous_date)
 ```
 
-**为什么是高坑?** 同一只股票在不同年代可能属于不同行业 (如某医药股 2019 年属"医药", 2023 年改属"医疗器械"). 用当前快照会导致行业约束错位.
+**为什么是高坑?** 同一只股票在不同年代可能属于不同行业 (行业分类会调整). 用当前快照会导致行业约束错位.
 
 ### 4.5 enforce_max_turnover (换手上限)
 
@@ -341,12 +406,103 @@ def enforce_max_turnover(current, target, max_pct):
         cur = current.get(c, 0.0)
         tgt = target.get(c, 0.0)
         out[c] = cur + (tgt - cur) * scale
+    # ⚠️ 本地不 re-normalize, 保留 sum < 1 由 fill_cash 补齐.
+    #    聚宽错误实现 `if abs(s-1) > epsilon: normalize` 会破坏 turnover 缩放语义.
+    s = sum(out.values())
+    if s > 1.0 + 1e-6:
+        out = {k: v / s for k, v in out.items()}
     return out
 ```
 
+### 4.5.1 fill_cash_with_remaining_candidates (现金沉淀填补)
+
+**本地** `runner.py` 在 3 个 enforce 之后**显式调用** `fill_cash_with_remaining_candidates`,
+用剩余候选股把 industry / turnover 缩放留下的 cash 沉淀填满.
+
+**为什么需要?** 当 `max_industry` 把某个行业缩到上限, 或者 `max_turnover` 把整体缩到上限,
+target_weights 的 sum 可能 < 1, 剩余 cash 不会被投资, 拖累收益.
+
+**实现**:
+```python
+def fill_cash_with_remaining_candidates(
+    target_weights, scores, target_n, max_single,
+    industry_map=None, max_industry=1.0,
+    cash_threshold=0.01, max_n_multiplier=2.0,
+):
+    if not scores or not target_weights:
+        return target_weights
+
+    leftover = 1.0 - sum(target_weights.values())
+    if leftover < cash_threshold:    # 残留 < 1% 不补
+        return target_weights
+
+    in_target = set(target_weights.keys())
+    # 按 score 降序, score > 0, 不在 target 中
+    candidates = sorted(
+        [(c, s) for c, s in scores.items() if c not in in_target and s > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    out = dict(target_weights)
+    max_n = int(target_n * max_n_multiplier)
+
+    for code, _score in candidates:
+        if len(out) >= max_n:        # 持仓数上限 = target_n × 2
+            break
+        leftover = 1.0 - sum(out.values())
+        if leftover < cash_threshold:
+            break
+
+        new_w = leftover
+        if max_single > 0 and new_w > max_single:
+            new_w = max_single
+
+        if industry_map is not None and max_industry < 1.0:
+            ind = industry_map.get(code, "unknown")
+            current_ind_total = sum(
+                w for c, w in out.items()
+                if industry_map.get(c, "unknown") == ind
+            )
+            ind_room = max_industry - current_ind_total
+            if ind_room <= 0:
+                continue
+            if new_w > ind_room:
+                new_w = ind_room
+
+        if new_w < cash_threshold:
+            continue
+
+        out[code] = new_w
+
+    return out
+```
+
+**调用位置** (`_do_rebalance` 中):
+```python
+target_weights = enforce_max_single_weight(target_weights, max_single)
+target_weights = enforce_industry_concentration(target_weights, g.industry_map, max_industry)
+current_weights = _compute_current_weights(context)
+target_weights = enforce_max_turnover(current_weights, target_weights, max_turnover)
+
+# ↓↓↓ 必须加 ↓↓↓
+target_weights = fill_cash_with_remaining_candidates(
+    target_weights=target_weights,
+    scores=scores,                  # ← scores 含所有股票 (含持仓), 详见 §2.5
+    target_n=target_n,
+    max_single=max_single,
+    industry_map=g.industry_map,
+    max_industry=max_industry,
+)
+```
+
+**为什么容易漏?** 3 个 enforce 函数都不修改 sum 之外的逻辑,
+调用者如果不显式补 fill_cash, 就不会有"现金补齐"这一步.
+本地 runner 在 3 个 enforce 之后紧跟着调 fill_cash, 是一对耦合的调用.
+
 ### 4.6 ⚠️ 常见漏实现的约束
 
-| 约束 | 默认值 | 是否容易漏 |
+| 约束 | 默认值 (本地) | 是否容易漏 |
 |---|---|---|
 | max_single_weight | 0.10 | 中 |
 | max_industry_concentration | 0.30 | 中 |
@@ -371,21 +527,47 @@ def update_after_bar(self, code, close):
     pos.holding_days += 1   # ← 每根 K 线 +1, 不是日历日
 ```
 
+**本地** `Portfolio.buy` (P3 修复, line 142):
+```python
+self.positions[code] = Position(
+    code=code, shares=shares,
+    entry_price=effective_entry, entry_date=date,
+    highest=price, holding_days=1,    # ← 1-based, 不是 0
+    entry_signals=entry_signals or [],
+)
+```
+
+**关键事实** (2026-06 更新, **P3 修复**):
+- buy 时 hd=**1** (1-based, 与 params 模式口径一致)
+- 旧版 hd=0 + update_after_bar +=1 实际是 1-based 但容易在 weight 模式 day-2 立即 exit 时记录为 hd=0
+- 新版直接 buy 设 hd=1, 统一跨模式口径
+
 **聚宽对应**:
 ```python
+# _execute_buy 中:
+g.holdings[stock] = {
+    "entry_price": effective_entry,
+    "highest_close": open_px,
+    "holding_days": 1,    # ← 1-based, 对齐本地 P3 修复
+    ...
+}
+
 # daily_handle step 1 中:
 for stock in list(g.holdings.keys()):
     h = g.holdings[stock]
-    # ... 更新 highest_close
+    h["highest_close"] = _max(h.get("highest_close", h["entry_price"]), t1_close)
+    h["prev_close"] = t1_close
     h["holding_days"] += 1   # ← 每个交易日 +1
 ```
 
 ⚠️ **错误实现**: `(context.current_dt.date() - entry_date.date()).days` 是日历日, 会比交易日多 ~30% (周末/假日).
 
-> 如果 `max_holding_days = 75`:
-> - 本地 (交易日): ≈ 105 个日历日
-> - 日历日版本: 75 个日历日 ≈ 53 个交易日
-> - **time_stop 触发时机相差近一倍!**
+⚠️ **常见错实现**: buy 时设 `holding_days=0` (旧版习惯, 已 P3 修复). 这会让 time_stop 晚 1 天触发:
+- max_holding_days=45 时, 正确 (hd=1 起步) 在 buy 日 + 44 触发
+- 错误 (hd=0 起步) 在 buy 日 + 45 触发, 差 1 个交易日
+
+> 时间类出场信号 (如 `holding_days >= N`) 用日历日会**提前**触发 (日历日走得更快),
+> 与本地行为**相差近一倍**.
 
 ### 5.2 highest_close 更新时机
 
@@ -436,7 +618,7 @@ self.positions[code] = Position(entry_price=effective_entry, ...)
 def _execute_buy(stock, open_px, shares, ...):
     # ...下单成交后...
     actual_amount = open_px * actual_shares
-    actual_fee = max(actual_amount * 0.0003, 5)
+    actual_fee = max(actual_amount * commission_rate, min_commission)
     effective_entry = (actual_amount + actual_fee) / actual_shares
     g.holdings[stock] = {"entry_price": effective_entry, ...}
 ```
@@ -450,12 +632,14 @@ g.holdings[stock] = {
     "entry_price": effective_entry,    # 含费成交价
     "entry_date": context.current_dt,   # 入场日期
     "highest_close": open_px,           # 持仓期间最高收盘价
-    "holding_days": 0,                  # 持仓交易日 (买入当日=0, 次日=1)
+    "holding_days": 1,                  # 持仓交易日 (P3 修复: 买入当日=1, 次日=2)
     "shares": actual_shares,            # 持仓股数
     "entry_signals": [...],             # 触发入场的信号列表 (用于统计)
     "prev_close": open_px,              # 上一交易日收盘价 (用于决策)
 }
 ```
+
+> ⚠️ 旧版 `holding_days: 0` 与本地 P3 修复不一致, 已修正为 `1`. 详见 §5.1.
 
 ---
 
@@ -483,12 +667,12 @@ df = df[df["代码"].isin(set(self.universe))].copy()
 
 **聚宽对应**: 聚宽 09:30 时 `cd.is_st` / `cd.paused` 不可靠, 推荐:
 1. 北交所用代码前缀过滤 (确定性)
-2. ST 信任 HS300 本身就剔除 (一般不含)
+2. ST 信任 universe 本身已剔除 (一般不含)
 3. 不要在 filter_universe 里调 attribute_history (太慢)
 
 ```python
 def filter_universe(raw_list, context):
-    """简化: 只剔除北交所. HS300 成员稳定, 不做其他过滤."""
+    """简化: 只剔除北交所. 大盘指数成员稳定, 不做其他过滤."""
     out = []
     for s in raw_list:
         if _is_bj(s):
@@ -516,15 +700,35 @@ def can_buy_at_open(bar, prev_close, code, epsilon=0.01):
     return True
 ```
 
-**聚宽对应**: 聚宽 09:30 时 `d.last_price` 可能为 0, `d.high_limit` 也未必准. 推荐**极简版**:
+**聚宽对应** (2026-06 更新): 聚宽 09:30 时 `d.paused` / `d.is_st` 不可靠, 但 `d.high_limit` / `d.low_limit` / `d.last_price` 仍可用. 之前推荐"极简版 return True"虽方便, 但**会让 sell 路径在跌停时下废单** (买入路径靠 `order.filled == 0` 兜底, 但卖出没有等效检查).
+
+**推荐实现** (检查 d.high_limit / d.low_limit):
 ```python
 def can_buy_at_open(d, stock):
-    """让 order() 自然处理一切异常, 涨停时 filled=0 自动跳过."""
+    """T 日开盘能否买入. 检查涨停 (last_price >= high_limit) 防止废单.
+    本地等价检查 bar.low == bar.high == limit_price (一字板).
+    注: d.high_limit = 0 表示无涨跌幅限制 (如新股上市首日), 此时不阻拦.
+    """
+    if d is None:
+        return False
+    if d.high_limit > 0 and d.last_price is not None and d.last_price > 0:
+        if d.last_price >= d.high_limit - 0.01:
+            return False  # 涨停: 不能买入
     return True
 
 def can_sell_at_open(d, stock):
+    """T 日开盘能否卖出. 检查跌停 (last_price <= low_limit) 防止废单."""
+    if d is None:
+        return False
+    if d.low_limit > 0 and d.last_price is not None and d.last_price > 0:
+        if d.last_price <= d.low_limit + 0.01:
+            return False  # 跌停: 不能卖出
     return True
 ```
+
+> **为什么不简化成 return True?** 
+> 买入路径有 `order.filled == 0` 兜底, 卖单虽然也有 `order_result` 检查, 但**跌停时 order 会返回非 None 但 filled=0**, 此时若继续走 `_execute_sell` 的删除持仓逻辑, 会丢失正确的"等明天"语义. 提前在 can_sell_at_open 拦截更准确.
+> **为什么不查 d.paused?** 09:30 时这个字段对未撮合股票默认 True, 误判严重.
 
 ### 6.4 ⚠️ order() 涨停处理 — 必须检查 filled
 
@@ -558,6 +762,53 @@ else:
     order_result = order(stock, shares)
 ```
 
+### 6.6 ⚠️ 科创板买入整手 200 股 (不是 100!)
+
+**A 股规则**: 科创板 (688xxx) 单笔买入申报**最低 200 股**, 卖出可不足 200 股 (零股卖出).
+主板/中小板/创业板仍为 100 股/手. 北交所已在前置过滤剔除.
+
+**错误实现** (整手 100, 会被聚宽拒单):
+```python
+shares = int(amount / open_px / 100) * 100   # 688 也会被错误按 100 整手
+```
+
+**正确实现**:
+```python
+# 科创板 200 股/手, 其他 100 股/手
+lot_size = 200 if stock.startswith("688") else 100
+shares = int(amount / open_px / lot_size) * lot_size
+if shares < lot_size:
+    continue   # 不够 1 手, 跳过 (避免 0 股订单)
+```
+
+**为什么是高坑?** 科创板 200 股整手是上交所的特殊规定, 容易和"全市场 100 股"混淆.
+若按 100 整手买 688, 聚宽会按 100 股下单, 系统直接拒单, 日志里只有 `order_result.filled=0`,
+不会报"参数错误", 排查困难.
+
+### 6.7 ⚠️ 科创板卖出限价也要加 9999.99 上限
+
+买入端有 `_min(open_px * 1.005, 9999.99)` 的上限保护. 卖出端常被遗漏:
+
+**错误实现** (只有下限, 无上限):
+```python
+if stock.startswith("688"):
+    limit_price = _max(open_px * 0.995, 0.01)   # ← 只有下限
+    if limit_price >= 10000:
+        limit_price = 9999.99                   # ← 这个判断对卖出端无效 (0.995x 不会 >= 10000)
+    order_result = order(stock, -shares, LimitOrderStyle(limit_price))
+```
+
+**正确实现** (买入卖出都用 `_min(..., 9999.99)`):
+```python
+if stock.startswith("688"):
+    limit_price = _max(open_px * 0.995, 0.01)   # 下限: 不低于 0.01
+    limit_price = _min(limit_price, 9999.99)    # 上限: 不高于 9999.99
+    order_result = order(stock, -shares, LimitOrderStyle(limit_price))
+```
+
+**为什么是坑?** 卖出 `_max(open_px * 0.995, 0.01)` 在正常股价下不可能 ≥ 10000,
+但若遇到极端情况 (退市残留/异常高价/数据错误), 9999.99 上限可避免 order 被聚宽拒为"价格超限".
+
 
 ---
 
@@ -590,12 +841,12 @@ _min = builtins.min
 
 ### 7.2 ⚠️ `attribute_history` 每股调用极慢
 
-**症状**: 300 只 HS300 每天 600+ 次 API 调用, 回测速度从分钟级降到小时级.
+**症状**: 大 universe 每天数千次 API 调用, 回测速度从分钟级降到小时级.
 
 **修复**: 用 `history()` 批量获取:
 ```python
 def calc_factors_batch(stock_list, context, n=100):
-    """4 次 API 拿所有股票数据, 替代 300×4=1200 次."""
+    """4 次 API 拿所有股票数据, 替代 N×4 次."""
     df_close = history(n, "1d", "close", stock_list, df=True, skip_paused=False, fq="pre")
     df_high = history(n, "1d", "high", stock_list, df=True, skip_paused=False, fq="pre")
     df_low = history(n, "1d", "low", stock_list, df=True, skip_paused=False, fq="pre")
@@ -611,16 +862,15 @@ def calc_factors_batch(stock_list, context, n=100):
     return out
 ```
 
-**性能对比** (300 只股票, 5 年回测):
+**性能对比** (假设 universe=N 只股票, 5 年回测):
 | 方法 | API 调用 | 耗时 |
 |---|---|---|
-| 每股 attribute_history(100) | ~300/天 | 数小时 |
+| 每股 attribute_history(100) | ~N/天 | 数小时 |
 | 批量 history(100) | ~4/天 | 几分钟 |
-| **加速比** | **75x** | - |
 
 ### 7.3 ⚠️ `get_current_data()` 在 09:30 不可靠
 
-**症状**: `filter_universe` 把 300 只全部判定为 `paused=True`.
+**症状**: `filter_universe` 把候选股票全部判定为 `paused=True`.
 
 **原因**: 09:30 触发时是开盘瞬间, 连续竞价刚开始, 聚宽对未撮合股票的 `cd.paused`/`cd.is_st`/`cd.last_price` 默认值不可靠.
 
@@ -673,22 +923,24 @@ if open_px <= 0:
 
 | 费用项 | 本地 (`fees.py`) | 聚宽推荐 (`OrderCost`) |
 |---|---|---|
-| 买入佣金 | 万 2.5 | `open_commission=0.00025` |
-| 卖出佣金 | 万 2.5 | `close_commission=0.00025` |
-| 沪市过户费 | 万 0.1 | ❌ 聚宽 API 不支持, 无法对齐 |
-| 卖出印花税 | 千 1 | `close_tax=0.001` |
+| 买入佣金 | `calc_buy_fee` | `open_commission=对应费率` |
+| 卖出佣金 | `calc_sell_fee` | `close_commission=对应费率` |
+| 沪市过户费 | `calc_buy_fee` / `calc_sell_fee` 内部 | ❌ 聚宽 API 不支持, 无法对齐 |
+| 卖出印花税 | `calc_sell_fee` | `close_tax=对应费率` |
 | 最低佣金 | 5 元 | `min_commission=5` |
 
 ```python
 set_order_cost(OrderCost(
     open_tax=0,
-    close_tax=0.001,
-    open_commission=0.00025,        # 万 2.5, 不是聚宽默认的 0.0003!
-    close_commission=0.00025,
+    close_tax=<印花税率>,
+    open_commission=<买入佣金率>,
+    close_commission=<卖出佣金率>,
     close_today_commission=0,
     min_commission=5
 ), type="stock")
 ```
+
+> **费率要与本地 `fees.py` 完全一致**, 否则每年累积差异显著.
 
 ### 8.2 滑点对齐
 
@@ -708,13 +960,13 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 
 ### 8.3 累计误差估计
 
-| 来源 | 单笔影响 | 一年累计 (假设 100 笔) |
+| 来源 | 单笔影响 | 一年累计 (假设 N 笔) |
 |---|---|---|
-| 佣金差 (万 0.5) | 0.005% | ~0.5% |
-| 沪市过户费 | 0.001% (仅 .SH) | ~0.05% |
-| 滑点 (0.05% 双向) | 0.1% | ~10% |
+| 佣金差 (如有) | 取决于费率差 | 约 N × 单笔差 |
+| 沪市过户费 | 取决于费率 | 约 N × 单笔差 |
+| 滑点 (0.05% 双向) | 0.1% | 约 N × 0.1% |
 
-⚠️ **滑点是最大差异源**, 务必显式设置.
+⚠️ **滑点通常是最大差异源**, 务必显式设置.
 
 
 ---
@@ -733,7 +985,7 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 
 ### 9.2 入场逻辑
 
-- ☐ ✅ `scores = {}` 只给非持仓股算 score
+- ☐ ✅ **`scores = {}` 必须含所有股票 (含持仓)**, 不要过滤持仓 (⚠️ 高坑, 违反"留赢家"意图)
 - ☐ ✅ `rank_top_n(scores, target_n, seed=42)` 必须传 seed
 - ☐ ✅ `if not top_codes: return` 无候选时持仓不动 (**高坑**)
 - ☐ ✅ `target_weights = {c: 1.0 / target_n for c in top_codes}` 等权起步
@@ -743,15 +995,20 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 - ☐ ✅ `enforce_max_single_weight` 软约束 + 缩放归一化
 - ☐ ✅ `enforce_industry_concentration` 软约束 + 缩放
 - ☐ ✅ `enforce_max_turnover` 不要漏!
+- ☐ ✅ **`fill_cash_with_remaining_candidates` 不要漏!** (⚠️ 高坑, 与本地 runner 对齐)
 - ☐ ✅ `get_industry(stock_list, date=context.previous_date)` 传历史日期 (**高坑**)
-- ☐ ✅ 约束链顺序: single → industry → turnover
+- ☐ ✅ 约束链顺序: single → industry → turnover → fill_cash
+- ☐ ⚠️ **3 个 enforce 函数的 re-normalize 仅在 sum > 1 + epsilon (overweight) 时执行**;
+      错误实现 `abs(s-1) > epsilon` 会让 cap 失效
 
 ### 9.4 出场逻辑
 
 - ☐ ✅ 出场每天检查 (不受 rebalance_freq 限制)
 - ☐ ✅ `sorted(exit_w, key=exit_w.get, reverse=True)` 按 weight 降序
 - ☐ ✅ 第一个触发就 return (不是 sum)
-- ☐ ⚠️ 如想"禁用"信号, 必须**从 exit_weights 删除**, 不要靠小 weight
+- ☐ ⚠️ 如想"禁用"信号, 必须 `weight=0` 或**从 exit_weights 删除**, **不要靠小 weight**
+- ☐ ⚠️ **spec 里设极小 weight 的信号, 脚本 `should_exit` 必须保留并仍触发**
+      (作为最低优先级兜底) — weight 仅决定优先级, 不决定是否启用
 
 ### 9.5 持仓状态
 
@@ -759,20 +1016,24 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 - ☐ ✅ `entry_price = (amount + fee) / shares` 含费
 - ☐ ✅ `highest_close` 用 T-1 收盘价更新 (下一日 step 1)
 - ☐ ✅ `prev_close` 缓存 T-1 收盘价 (出场决策用)
+- ☐ ⚠️ **holding_days 1-based (buy 设 1, step 1 +=1 → hd=2)**: 对齐本地 runner P3 修复
+      (subjects/subject/backtest/portfolio.py:142). 旧版 buy 设 0 会让 time_stop 晚 1 天触发.
 
 ### 9.6 A 股规则
 
 - ☐ ✅ 北交所代码前缀过滤 (`4/8/92xxxx`)
-- ☐ ✅ ST 信任 HS300/universe, 不在 09:30 检查 `cd.is_st`
+- ☐ ✅ ST 信任 universe 本身已剔除, 不在 09:30 检查 `cd.is_st`
 - ☐ ✅ `filter_universe` 不调 `attribute_history` (性能!)
-- ☐ ✅ `can_buy_at_open` / `can_sell_at_open` 极简版 (return True)
+- ☐ ✅ `can_buy_at_open` / `can_sell_at_open` 检查 d.high_limit / d.low_limit (防止卖跌停下废单)
 - ☐ ✅ 检查 `order_result.filled` (涨停时 filled=0)
 - ☐ ✅ 科创板 (688) 用 `LimitOrderStyle`
+- ☐ ⚠️ **科创板 (688) 买入整手 200 股, 其他 100 股** (`lot_size = 200 if '688' else 100`)
+- ☐ ⚠️ 科创板卖出限价**也要**加 `_min(limit_price, 9999.99)` 上限, 与买入端对齐
 
 ### 9.7 性能
 
 - ☐ ✅ `calc_factors_batch` 用 `history()` 批量
-- ☐ ✅ 单股 fallback `calc_factors_t1` 仅用于持仓股不在 universe 时
+- ☐ ✅ 单股 fallback 仅用于持仓股不在 universe 时
 - ☐ ✅ universe 缓存策略 (可选优化)
 
 ### 9.8 内置函数 (聚宽环境)
@@ -784,8 +1045,8 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 
 ### 9.9 费用与滑点
 
-- ☐ ✅ `OrderCost(open_commission=0.00025, close_commission=0.00025)` (万 2.5)
-- ☐ ✅ `OrderCost(close_tax=0.001)` (印花税千 1)
+- ☐ ✅ `OrderCost(open_commission=本地费率, close_commission=本地费率)`
+- ☐ ✅ `OrderCost(close_tax=本地印花税率)`
 - ☐ ✅ `set_slippage(FixedSlippage(0))` 完全对齐 / `FixedSlippage(0.0005)` 保守
 
 ### 9.10 复权与数据
@@ -797,90 +1058,33 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
 
 ---
 
-## 10. 标杆参照实现
+## 10. 关键不变量
 
-完整可运行的对齐脚本: `joinQuant/trend_momentum_strategy_1.py`
-
-### 10.1 脚本结构 (10 个章节)
-
-```
-1. PARAMS 配置区
-   ├─ benchmark / universe_index
-   ├─ 因子窗口
-   ├─ 入场/出场阈值
-   ├─ 5 个仓位约束
-   ├─ entry_weights / exit_weights
-   └─ tie_break_seed = 42
-
-2. initialize (单一调度 run_daily 09:30)
-
-3. 因子计算
-   ├─ _ema / _atr / _rsi (helpers)
-   ├─ calc_factors_t1 (单股 fallback)
-   └─ calc_factors_batch (批量主流程)
-
-4. 入场信号
-   ├─ get_triggered_signals
-   └─ entry_score
-
-5. 出场信号
-   ├─ _check_exit_signal
-   └─ should_exit (按 weight 降序)
-
-6. 排序与约束
-   ├─ rank_top_n (seed=42 + shuffle)
-   ├─ enforce_max_single_weight
-   ├─ enforce_industry_concentration
-   ├─ enforce_max_turnover
-   └─ should_rebalance
-
-7. A 股规则
-   ├─ _is_bj
-   ├─ filter_universe (只剔除北交所)
-   ├─ get_industry_map (传 date)
-   ├─ can_buy_at_open / can_sell_at_open (return True)
-
-8. daily_handle 主循环 (5 步)
-   ├─ step 1: 更新 highest_close + holding_days += 1
-   ├─ step 2: 刷新 universe (含 industry)
-   ├─ step 3: 算因子 + score
-   ├─ step 4: 出场决策 (每天)
-   └─ step 5: 调仓 (调仓日)
-
-9. _do_rebalance
-   ├─ rank_top_n
-   ├─ enforce 链
-   ├─ 卖出不在 target 的
-   └─ 买入新进的
-
-10. 执行
-    ├─ _execute_buy (含费 entry_price)
-    └─ _execute_sell (检查 last_price fallback)
-```
-
-### 10.2 关键不变量
+任何策略对接都必须遵守的约定, 不可改动:
 
 ```python
 # 这些约定不要改:
-- bar_index 从 1 开始
+- bar_index 从 1 开始 (本地 enumerate(..., 1))
 - 首日 (bar_idx=1) 完全跳过交易
 - 出场每天做, 入场只在调仓日做
-- holding_days 是交易日, 不是日历日
+- holding_days 是交易日, 不是日历日; 1-based (buy 设 1, P3 修复)
 - entry_price 含买入费用
 - rank_top_n seed=42 (保证可复现)
 - 5 个仓位约束按顺序链式应用
 - get_industry_map 必须传 date 参数
+- exit weight == 0 才是真正禁用, weight > 0 都参与触发
+- can_buy/sell_at_open 必须检查 d.high_limit / d.low_limit (卖跌停不能下废单)
 ```
 
 ---
 
 ## 11. 调试与差异定位
 
-### 11.1 当本地与聚宽差距 > 10% 时, 按顺序排查
+### 11.1 当本地与聚宽差距 > 5% 时, 按顺序排查
 
 1. **第一步**: 对比两边的**首次调仓日**:
-   - 本地: bar_idx=5 (即第 5 个交易日)
-   - 聚宽: g.bar_index=5
+   - 本地: bar_idx=freq (即第 freq 个交易日)
+   - 聚宽: g.bar_index=freq
    - 若不一致 → 检查首日是否正确跳过 (bar_idx==1)
 
 2. **第二步**: 对比两边的**入场日股票列表**:
@@ -888,14 +1092,15 @@ set_slippage(FixedSlippage(0.0005))   # 保留聚宽默认
    - 若不一致 → 检查 entry_score 计算是否一致
 
 3. **第三步**: 对比两边的**出场触发分布**:
-   - 应该有相同的出场信号分布 (rsi_overbought / trailing_stop / time_stop)
+   - 应该有相同的出场信号分布
    - 若分布差异大 → 检查 holding_days (交易日 vs 日历日)
-   - 若 trend_reversal 多 → 检查权重为 1e-8 时是否仍触发 (本地行为)
+   - 若极小 weight 的信号缺失 → 检查 `should_exit` 是否错误地跳过了这些信号
+     (正确行为是 weight > 0 都参与触发)
 
 4. **第四步**: 对比**单笔交易的 PnL**:
    - 公式: `(open_px - effective_entry) * shares - sell_fee`
-   - 若差异 ~ 0.05% → 滑点差异 (聚宽 vs 本地)
-   - 若差异 ~ 0.03% → 佣金差异 (万 3 vs 万 2.5)
+   - 若差异 ≈ 0.05% → 滑点差异 (聚宽 vs 本地)
+   - 若差异 ≈ 佣金差 → 检查 OrderCost 费率
    - 若差异 > 0.5% → 检查 entry_price 是否含费
 
 5. **第五步**: 对比**调仓日的仓位约束**:
@@ -933,19 +1138,27 @@ log.info(">>> 卖出 %s: %d股 @ %.2f, PnL=%.2f, 持仓=%d交易日, 信号=%s" 
 |---|---|---|---|
 | 1 | `sum(d.values())` 被 numpy 覆盖 | `TypeError: dict_values vs int` | 用 `_sum = builtins.sum` |
 | 2 | `max(a, b)` 被 numpy 覆盖 | `axis 参数错误` | 用 `_max = builtins.max` |
-| 3 | `filter_universe` 用 `cd.paused` | `300 只全部被过滤为 paused` | 删除 paused 检查 |
-| 4 | `can_buy_at_open` 检查 `cd.is_st` | `7 只候选全部无法买入` | 简化为 `return True` |
+| 3 | `filter_universe` 用 `cd.paused` | 候选全部被过滤为 paused | 删除 paused 检查 |
+| 4 | `can_buy_at_open` 检查 `cd.is_st` | 候选全部无法买入 | 简化为 `return True` |
 | 5 | `filter_universe` 调 `attribute_history` | 回测极慢 (小时级) | 删除上市天数检查 |
-| 6 | 单股 `attribute_history` | 每天 300+ API 调用 | 用 `history()` 批量 |
+| 6 | 单股 `attribute_history` | 每天 N+ API 调用 | 用 `history()` 批量 |
 | 7 | `scores={}` 时全部清仓 | 弱市变 100% 现金 | `if not top_codes: return` |
 | 8 | `get_industry()` 没传 date | 用当前快照而非历史 | 传 `date=previous_date` |
-| 9 | `holding_days` 用日历日 | time_stop 触发提前 | 改成交易日 +=1 |
-| 10 | `entry_price` 不含费 | PnL 偏乐观 0.03% | `(amount + fee) / shares` |
-| 11 | exit weight=1e-8 当"禁用" | trend_reversal 仍频繁触发 | 真要禁用就删除 |
+| 9 | `holding_days` 用日历日 | 时间类出场信号触发提前 | 改成交易日 +=1 |
+| 10 | `entry_price` 不含费 | PnL 偏乐观 | `(amount + fee) / shares` |
+| 11 | exit 极小 weight 误当"禁用" | 低优先级信号被跳过, 兜底失效 | `should_exit` 仅跳过 `weight == 0`, 极小 weight 仍参与触发 |
 | 12 | 涨停时 `order` 返回非 None | 错误记录持仓 | 检查 `order.filled > 0` |
 | 13 | 14:55 决策 + 09:30 执行 | 使用了 T 日盘中数据 | 改成 09:30 单一调度 |
 | 14 | 没设 `fq="pre"` | 默认后复权, 价格异常 | 显式传 `fq="pre"` |
 | 15 | 加仓/减仓逻辑 | 本地引擎不支持 | 删除这部分代码 |
+| 16 | 科创板 (688) 整手 100 股 | order 被聚宽拒, 无明显报错 | `lot_size = 200 if '688' else 100` |
+| 17 | enforce_* re-normalize `abs(s-1) > epsilon` | cap 失效, 持仓超 max_single | 仅 `sum > 1 + epsilon` 时 re-normalize |
+| 18 | 科创板卖出限价缺 9999.99 上限 | 极端价时 order 被拒 | `_min(limit_price, 9999.99)` |
+| 19 | `set_universe()` 未在 initialize 预填 | 每天 N+ lazy load 慢 | initialize 末尾 `set_universe(stock_list)` |
+| 20 | **scores 过滤持仓(`if stock not in g.holdings`)** | 调仓日所有持仓被无差别卖出 | 删掉过滤, scores 含所有股票 |
+| 21 | **未调 `fill_cash_with_remaining_candidates`** | industry/turnover 缩放后 cash 沉淀 | 3 enforce 后紧接 fill_cash |
+| 22 | **holding_days 旧版用 0-based (buy 设 0)** | time_stop 晚 1 天触发, 与本地 P3 修复不一致 | buy 改设 1, step 1 +=1 (1-based) |
+| 23 | **`can_buy/sell_at_open` 极简化 (return True)** | 卖跌停时下废单, 浪费订单且日志噪音大 | 检查 d.high_limit / d.low_limit 提前拦截 |
 
 ---
 
@@ -977,7 +1190,7 @@ def self_check():
     for sig, w in p.get("exit_weights", {}).items():
         if 0 < w < 1e-6:
             issues.append(f"exit_weights[{sig}] = {w:.2e}, "
-                          f"weight 极小但仍会触发, 如想禁用请删除该项")
+                          f"weight 极小但仍会触发, 如想禁用请删除该项或设 weight=0")
 
     if issues:
         log.warn("=== PARAMS 自检发现 %d 个问题 ===" % len(issues))
@@ -990,7 +1203,6 @@ def self_check():
 
 ---
 
-**版本**: 1.0
-**创建日期**: 2026-06-14
-**参照标杆**: `joinQuant/trend_momentum_strategy_1.py`
-**对齐目标**: 与 `subjects/subject/backtest/runner.py::_run_weight` 完全等价
+**版本**: 2.0 (通用规则化重写)
+**适用范围**: 任何从本地 weight 引擎迁移到聚宽回测的策略
+**对齐目标**: 与 `subjects/subject/backtest/runner.py::_run_weight` 行为等价

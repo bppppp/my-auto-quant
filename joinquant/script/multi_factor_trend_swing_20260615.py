@@ -1,28 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-多指标共振趋势策略 - 严格 T-1 回测模式 (Local-Engine Equivalent)
-==================================================================
-策略名称: trend_momentum_strategy_1
-策略文档: D:/my-auto-quant/result/trend_momentum_strategy_1/trend_momentum_strategy_1_final.md
+多因子趋势波段策略 (Multi-Factor Trend Swing) - 严格 T-1 回测模式
+================================================================
+策略名称: multi_factor_trend_swing
+策略文档: D:/project/quant/my-quant3/result/multi_factor_trend_swing/multi_factor_trend_swing_final.md
 回测平台: JoinQuant (聚宽)
 
-本脚本严格按本地 weight 回测引擎 (subjects/subject/backtest/runner.py::_run_weight)
-的语义实现, 用于对齐本地与聚宽的回测结果:
+策略定位 (中期波段, 与短期趋势动量不同):
+- universe: 固定测试集 (HS300 + CYB_STAR_50, 共 356 只, 来自 data/config.py)
+          本地等价: _resolve_universe(["HS300", "CYB_STAR_50"])
+- 持仓周期: 典型 15-30 个交易日, max_holding_days=45 兜底
+- 12 只持仓 × 10% 单票 = 高分散 (vs 趋势动量的 7×40% 集中)
+- 5 因子加权共振入场 (任一触发即得对应权重分, 5 项加权和即 entry_score):
+    trend_strength (0.30)   : ma_10 > ma_30 AND ma_30 > ma_60
+    atr_filter    (0.15)   : atr_14 / close > atr_threshold
+    volume_confirm(0.10)   : volume_ratio_20 > vol_threshold
+    momentum_filter(0.25)  : mom_60 > mom_threshold
+    rsi_filter    (0.20)   : rsi_14 < rsi_upper
+  → 5 项加权和 = 1.0 (满分)
+- 调仓: 每 5 个交易日 (rebalance_freq_days)
+- 5 仓位约束: target_holdings=12 / max_single=0.10 / max_industry=0.30
+              / max_turnover=0.30 / rebalance_freq_days=5
+- 出场 (按 weight 降序, weight=0 显式禁用):
+    trailing_stop  (0.45)  ← 优先级最高
+    time_stop      (0.40)
+    rsi_overbought (0.10)
+    fixed_stop     (0.05)  ← 兜底
+    trend_reversal (0.00)  ← 禁用 (spec 显式标注)
 
-关键约定:
-1. **T-1 因子决策 + T 开盘成交**: 严格无前视
-   - 09:30 触发, 用 attribute_history(end=T-1) 拿严格 T-1 数据
-   - 用 get_current_data().last_price (T 开盘价) 成交
+回测约定 (与本地 weight 引擎 1:1 对齐, 见 subjects/subject/backtest/runner.py::_run_weight):
+1. **T-1 因子决策 + T 开盘成交**: 09:30 单一调度, 严格无前视
 2. **score-based 排序**: entry_score = Σ(触发信号 × weight), rank_top_n + random tie-break
-3. **5 个仓位约束**: max_single_weight / max_industry_concentration / max_turnover_per_rebalance
-   / target_holdings / rebalance_freq_days
-4. **出场优先级动态读权重**: sorted(exit_weights, key=weights.get, reverse=True)
-5. **holding_days 按交易日累加** (每个交易日 +1, 非日历日)
-6. **entry_price 含费用调整**: (amount + fee) / shares
-7. **ST / 北交所自动过滤**
-8. **无加仓 / 无减仓** (本地引擎不支持, 故此脚本也禁用)
+3. **holding_days 按交易日累加** (1-based: buy 设 1, step 1 +=1 → hd=2, 对齐本地 P3 修复; time_stop 触发日 = buy 日 + max_holding_days - 1)
+4. **entry_price 含费用调整**: (amount + fee) / shares
+5. **ST / 北交所自动过滤** (北交所代码前缀 4/8/92)
+6. **无加仓 / 无减仓** (spec 无 add/reduce_position_weight_threshold 字段)
 
-目标: 年化 25%, 胜率 48%, 盈亏比 3.2, 夏普 1.5, 最大回撤 -18%
+目标: 年化 22%, 胜率 52%, 盈亏比 2.9, 夏普 1.35, 最大回撤 -12%
 """
 
 from jqdata import *
@@ -41,59 +55,60 @@ _min = builtins.min
 
 
 # ============================================================
-# 1. 参数配置区 (与本地引擎读取的 yaml 参数完全一致)
+# 1. 参数配置区 (基于 spec final.md 调优后参数)
 # ============================================================
 PARAMS = {
     # ---- 标的与基准 ----
     "benchmark": "000300.XSHG",
-    # 固定股票池模式: HS300 (300) + CYB_STAR_50 (创业板50+科创50, 100)
-    # 合并去重排除北交所共 356 只, 对应本地 _resolve_universe 行为
-    # 详见 FIXED_UNIVERSE 常量 (脚本末尾)
+    # universe: 固定测试集 (HS300 + CYB_STAR_50, 共 356 只, 来自 data/config.py)
+    # 本地等价: _resolve_universe(["HS300", "CYB_STAR_50"])
     "use_fixed_universe": True,
-    "universe_index": "000300.XSHG",  # 仅 benchmark 备用, 不再用于动态获取成分股
+    "universe_index": "000300.XSHG",  # 仅 use_fixed_universe=False 时使用 (动态取 HS300)
 
     # ---- 因子窗口 ----
-    "ma_short": 5,
-    "ma_mid": 20,
-    "ma_long": 60,
-    "atr_period": 14,
-    "rsi_period": 14,
-    "macd_fast": 12,
-    "macd_slow": 26,
-    "macd_signal_period": 9,
-    "volume_ma_period": 20,
+    "ma_short": 10,            # spec: ma_10
+    "ma_mid": 30,              # spec: ma_30
+    "ma_long": 60,             # spec: ma_60
+    "atr_period": 14,          # spec: atr_14
+    "rsi_period": 14,          # spec: rsi_14
+    "volume_ma_period": 20,    # spec: volume_ratio_20
+    "mom_lookback": 60,        # spec: 60 日动量 (close / close.shift(60) - 1)
 
-    # ---- 入场阈值 (trend_momentum_entry AND 全部满足) ----
-    "rsi_low": 30,
-    "rsi_high": 80,
-    "atr_min": 0.015,
-    "vol_min": 1.0,
+    # ---- 入场阈值 (5 因子各因子独立判断) ----
+    "atr_threshold": 0.08,     # spec: atr_14 / close > 0.08 (过滤低波股)
+    "vol_threshold": 1.4,      # spec: volume_ratio_20 > 1.4 (量能放大 1.4 倍)
+    "mom_threshold": 0.12,     # spec: mom_60 > 12% (中期上升趋势)
+    "rsi_upper": 60,           # spec: rsi_14 < 60 (避免超买区域入场)
 
     # ---- 出场阈值 ----
-    "rsi_overbought": 84,
-    "trailing_stop_pct": 0.15,
-    "max_holding_days": 75,
-    "fixed_stop_pct": 0.13,
+    "fixed_stop_pct": 0.13,        # spec: 固定止损 -13% (从 entry_price 算)
+    "trailing_stop_pct": 0.09,     # spec: 移动止损 -9% (从 highest_close 算)
+    "max_holding_days": 45,        # spec: 时间止损 45 个交易日
+    "rsi_overbought": 80,          # spec: RSI 超买卖出 > 80
 
-    # ---- 仓位约束 (与本地引擎 enforce_xxx 函数对齐) ----
-    "target_holdings": 7,
-    "max_single_weight": 0.4,
-    "max_industry_concentration": 0.5,
-    "max_turnover_per_rebalance": 0.5,
+    # ---- 仓位约束 (与本地 enforce_xxx 函数对齐) ----
+    "target_holdings": 12,
+    "max_single_weight": 0.10,
+    "max_industry_concentration": 0.30,
+    "max_turnover_per_rebalance": 0.30,
 
     # ---- 调仓频率 ----
     "rebalance_freq_days": 5,
 
-    # ---- 信号权重 (用于 score + 出场优先级) ----
+    # ---- 信号权重 (用于 score + 出场优先级, spec 显式定义) ----
     "entry_weights": {
-        "trend_momentum_entry": 1.0,
+        "trend_strength": 0.30,
+        "atr_filter": 0.15,
+        "volume_confirm": 0.10,
+        "momentum_filter": 0.25,
+        "rsi_filter": 0.20,
     },
     "exit_weights": {
-        "rsi_overbought_stop": 3.0,    # 优先级最高
-        "trailing_stop": 0.5,
-        "time_stop": 0.3,
-        "trend_reversal": 1e-8,         # 几乎禁用
-        "fixed_stop": 1e-8,             # 几乎禁用
+        "trailing_stop": 0.45,         # 优先级最高
+        "time_stop": 0.40,
+        "rsi_overbought": 0.10,
+        "fixed_stop": 0.05,            # 兜底止损, 仍触发
+        "trend_reversal": 0.0,         # weight=0, 被 should_exit 过滤 (显式禁用)
     },
 
     # ---- tie-break random seed (与本地 rank_top_n seed=42 对齐) ----
@@ -124,33 +139,40 @@ def initialize(context):
 
     # ---- 全局状态 ----
     g.params = PARAMS
-    g.universe = []
+    g.universe = []                 # 候选池 (T-1 快照, 每天刷新)
     # holdings: {stock: {entry_price, entry_date, highest_close, holding_days,
     #                     shares, entry_signals, prev_close}}
     g.holdings = {}
-    g.industry_map = {}      # 由 daily_handle 每次刷新
-    g.bar_index = 0           # 0-based → 1-based 交易日索引 (本地 enumerate(..., 1))
+    g.industry_map = {}             # 由 daily_handle 每次刷新 (T-1 行业快照)
+    g.bar_index = 0                  # 0-based → 1-based 交易日索引 (本地 enumerate(..., 1))
 
     # ---- 一次性调度: 09:30 用 T-1 因子决策 + T 开盘成交 ----
     # 本地引擎: enumerate(trading_dates) 每日触发一次主循环
     # 聚宽对应: 09:30 触发 daily_handle (此时 attribute_history 返回严格 T-1 数据)
     run_daily(daily_handle, time="09:30")
 
+    # ---- 预填 universe: 让 get_current_data() / history() 走 preload ----
+    # FIXED_UNIVERSE 在脚本末尾定义; initialize 是运行时才执行, 此处可直接引用.
+    if PARAMS.get("use_fixed_universe", False):
+        set_universe(FIXED_UNIVERSE)
+
     log.info("=" * 60)
-    log.info("=== trend_momentum_strategy_1 (严格 T-1 模式) 初始化完成 ===")
-    log.info("目标: 年化25%, 胜率48%, 盈亏比3.2, 夏普1.5, 最大回撤18%")
+    log.info("=== multi_factor_trend_swing (中期波段) 初始化完成 ===")
+    log.info("universe: 固定测试集 (HS300 + CYB_STAR_50, 共 %d 只, 来自 data/config.py)" % len(FIXED_UNIVERSE))
+    log.info("目标: 年化22%, 胜率52%, 盈亏比2.9, 夏普1.35, 回撤12%")
     log.info("决策模型: T-1 因子 + T 开盘成交 (与本地 weight 引擎完全等价)")
     log.info("=" * 60)
 
+    # ---- 启动前自检 ----
+    self_check()
+
 
 # ============================================================
-# 3. 因子计算 (严格用 T-1 收盘前的数据)
+# 3. 因子计算 (5 因子: ma_10/30/60, atr_14, rsi_14, volume_ratio_20, mom_60)
 # ============================================================
-def _ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
-
-
 def _atr(high, low, close, period=14):
+    """14 日 ATR = TR(14) 滚动均值. TR = max(high-low, |high-prev_close|, |low-prev_close|).
+    与本地 subject.factors.atr 实现一致."""
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()
@@ -160,6 +182,8 @@ def _atr(high, low, close, period=14):
 
 
 def _rsi(close, period=14):
+    """14 日 RSI. 与本地 subject.factors.rsi 实现一致.
+    avg_loss=0 时按 NaN 处理 (rs→inf → rsi=100), 与本地行为一致."""
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
@@ -170,17 +194,19 @@ def _rsi(close, period=14):
     return rsi.fillna(100.0)
 
 
+def _mom(close, lookback=60):
+    """N 日动量 = close_t / close_{t-N} - 1.
+    与 spec 公式 (close / lag(close, 60) - 1) 和本地 subject.factors.mom 实现一致.
+    数据不足 lookback+1 行时返回全 NaN Series (与本地 mom 行为一致).
+    """
+    if len(close) < lookback + 1:
+        return pd.Series([float("nan")] * len(close), index=close.index)
+    return close / close.shift(lookback) - 1.0
+
+
 def calc_factors_t1(stock, context, n=100):
-    """
-    严格用 T-1 及之前的数据计算因子.
-    聚宽 attribute_history(n, '1d') 在 09:30 调用时返回 [T-n, T-1] 共 n 条 K线,
-    不含当日, 与本地引擎 hist.iloc[:idx_today] 等价.
-
-    返回: dict 或 None
-
-    注: 此函数为单股版本, 用于持仓股不在 universe 时的 fallback.
-    主流程用 calc_factors_batch (批量 history) 加速.
-    """
+    """单股因子计算 (fallback, 持仓股不在 universe 时使用).
+    严格用 T-1 及之前的数据 (attribute_history 在 09:30 调用返回 [T-n, T-1] K线)."""
     p = g.params
     try:
         df = attribute_history(stock, n, "1d",
@@ -194,26 +220,22 @@ def calc_factors_t1(stock, context, n=100):
         low = df["low"]
         volume = df["volume"]
 
-        last_close = close.iloc[-1]  # T-1 收盘价
+        last_close = close.iloc[-1]
         if last_close <= 0 or np.isnan(last_close):
             return None
 
         return {
             "close": last_close,
-            "ma_5": close.tail(p["ma_short"]).mean(),
-            "ma_20": close.tail(p["ma_mid"]).mean(),
+            "ma_10": close.tail(p["ma_short"]).mean(),
+            "ma_30": close.tail(p["ma_mid"]).mean(),
             "ma_60": close.tail(p["ma_long"]).mean(),
             "atr_14": _atr(high, low, close, p["atr_period"]).iloc[-1],
             "rsi_14": _rsi(close, p["rsi_period"]).iloc[-1],
-            "macd_line": (_ema(close, p["macd_fast"]) - _ema(close, p["macd_slow"])).iloc[-1],
-            "macd_signal": _ema(
-                _ema(close, p["macd_fast"]) - _ema(close, p["macd_slow"]),
-                p["macd_signal_period"],
-            ).iloc[-1],
             "volume_ratio_20": (
                 volume.iloc[-1] / volume.tail(p["volume_ma_period"]).mean()
                 if volume.tail(p["volume_ma_period"]).mean() > 0 else 0
             ),
+            "mom_60": _mom(close, p["mom_lookback"]).iloc[-1],
         }
     except Exception as e:
         log.warn("计算 %s 因子异常: %s" % (stock, str(e)))
@@ -221,21 +243,16 @@ def calc_factors_t1(stock, context, n=100):
 
 
 def calc_factors_batch(stock_list, context, n=100):
-    """
-    批量计算所有股票的 T-1 因子. 用 history() 一次性获取数据,
-    避免对每只股票单独调 attribute_history (300 只 = 300+ 次 API → 1 次 API).
+    """批量计算所有候选股的 T-1 因子. 用 history() 一次性获取数据,
+    避免对每只股票单独调 attribute_history (300 只 = 300+ 次 API → 4 次 API).
 
-    history(n, '1d') 在 09:30 调用时返回 [T-n, T-1] 共 n 条 K线, 不含当日,
-    与 attribute_history 语义一致.
-
-    返回: {stock: factor_dict, ...}
+    返回: {stock: factor_dict, ...}  (只取 iloc[-1], 不返回 Series, 与 09:30 单触发设计匹配)
     """
     p = g.params
     if not stock_list:
         return {}
 
     try:
-        # 一次性批量获取 close/high/low/volume (4 次 API 总调用)
         df_close = history(n, "1d", "close", stock_list, df=True,
                           skip_paused=False, fq="pre")
         df_high = history(n, "1d", "high", stock_list, df=True,
@@ -270,22 +287,12 @@ def calc_factors_batch(stock_list, context, n=100):
             if pd.isna(last_close) or last_close <= 0:
                 continue
 
-            ma_5 = close.tail(p["ma_short"]).mean()
-            ma_20 = close.tail(p["ma_mid"]).mean()
+            ma_10 = close.tail(p["ma_short"]).mean()
+            ma_30 = close.tail(p["ma_mid"]).mean()
             ma_60 = close.tail(p["ma_long"]).mean()
 
-            atr_series = _atr(high, low, close, p["atr_period"])
-            atr_14 = atr_series.iloc[-1]
-
-            rsi_series = _rsi(close, p["rsi_period"])
-            rsi_14 = rsi_series.iloc[-1]
-
-            ema_fast = _ema(close, p["macd_fast"])
-            ema_slow = _ema(close, p["macd_slow"])
-            macd_line_series = ema_fast - ema_slow
-            macd_signal_series = _ema(macd_line_series, p["macd_signal_period"])
-            macd_line = macd_line_series.iloc[-1]
-            macd_signal = macd_signal_series.iloc[-1]
+            atr_14 = _atr(high, low, close, p["atr_period"]).iloc[-1]
+            rsi_14 = _rsi(close, p["rsi_period"]).iloc[-1]
 
             vol_ma_20 = volume.tail(p["volume_ma_period"]).mean()
             volume_ratio_20 = (
@@ -293,16 +300,19 @@ def calc_factors_batch(stock_list, context, n=100):
                 if vol_ma_20 and vol_ma_20 > 0 else 0
             )
 
+            # mom_60: 需要 lookback+1 行, 取 iloc[-1] (T-1 动量)
+            # _mom 数据不足时返回全 NaN, iloc[-1] 自然是 NaN, get_triggered_signals 会否决
+            mom_60 = _mom(close, p["mom_lookback"]).iloc[-1]
+
             out[stock] = {
                 "close": last_close,
-                "ma_5": ma_5,
-                "ma_20": ma_20,
+                "ma_10": ma_10,
+                "ma_30": ma_30,
                 "ma_60": ma_60,
                 "atr_14": atr_14,
                 "rsi_14": rsi_14,
-                "macd_line": macd_line,
-                "macd_signal": macd_signal,
                 "volume_ratio_20": volume_ratio_20,
+                "mom_60": mom_60,
             }
         except Exception:
             continue
@@ -311,43 +321,57 @@ def calc_factors_batch(stock_list, context, n=100):
 
 
 # ============================================================
-# 4. 入场信号 + score (对齐本地 entry_score / get_triggered_signals)
+# 4. 入场信号 (5 因子加权共振, 各因子独立判断, 加权求和)
 # ============================================================
 def get_triggered_signals(factors, p):
-    """
-    返回触发的入场信号名列表. 当前只有 trend_momentum_entry.
-    对应本地: strategy.get_triggered_signals(factors, params, weights)
+    """5 个入场信号独立判断, 任一触发就加入 triggered 列表.
+    任意因子为 NaN 直接否决 (防止脏数据触发).
+
+    对应本地: strategy.get_triggered_signals (subjects/<strategy>/generated/strategy.py).
     """
     triggered = []
     close = factors.get("close")
-    ma_5 = factors.get("ma_5")
-    ma_20 = factors.get("ma_20")
+    ma_10 = factors.get("ma_10")
+    ma_30 = factors.get("ma_30")
     ma_60 = factors.get("ma_60")
-    macd_line = factors.get("macd_line")
-    macd_signal = factors.get("macd_signal")
-    rsi_14 = factors.get("rsi_14")
     atr_14 = factors.get("atr_14")
+    rsi_14 = factors.get("rsi_14")
     volume_ratio_20 = factors.get("volume_ratio_20")
+    mom_60 = factors.get("mom_60")
 
-    # 任意 NaN 直接否决
-    for v in (close, ma_5, ma_20, ma_60, macd_line, macd_signal,
-              rsi_14, atr_14, volume_ratio_20):
+    # 任意 NaN → 整票否决
+    for v in (close, ma_10, ma_30, ma_60, atr_14, rsi_14, volume_ratio_20, mom_60):
         if v is None or (isinstance(v, float) and np.isnan(v)):
             return triggered
 
-    if (ma_5 > ma_20 > ma_60
-            and macd_line > macd_signal
-            and p["rsi_low"] < rsi_14 < p["rsi_high"]
-            and atr_14 / close > p["atr_min"]
-            and volume_ratio_20 > p["vol_min"]):
-        triggered.append("trend_momentum_entry")
+    # 1. trend_strength (weight 0.30): 多头排列 ma_10 > ma_30 AND ma_30 > ma_60
+    if ma_10 > ma_30 and ma_30 > ma_60:
+        triggered.append("trend_strength")
+
+    # 2. atr_filter (weight 0.15): 波动过滤 atr_14 / close > atr_threshold
+    if atr_14 / close > p["atr_threshold"]:
+        triggered.append("atr_filter")
+
+    # 3. volume_confirm (weight 0.10): 量能确认 volume_ratio_20 > vol_threshold
+    if volume_ratio_20 > p["vol_threshold"]:
+        triggered.append("volume_confirm")
+
+    # 4. momentum_filter (weight 0.25): 60 日动量 mom_60 > mom_threshold
+    if mom_60 > p["mom_threshold"]:
+        triggered.append("momentum_filter")
+
+    # 5. rsi_filter (weight 0.20): 不超买 rsi_14 < rsi_upper
+    if rsi_14 < p["rsi_upper"]:
+        triggered.append("rsi_filter")
+
     return triggered
 
 
 def entry_score(factors, p):
-    """
-    入场加权评分 = Σ(触发信号 × entry_weights[信号]).
-    对应本地 signals.score_entry: 当前只有 trend_momentum_entry (weight=1.0).
+    """入场加权评分 = Σ(触发信号 × entry_weights[信号]).
+    5 项加权和范围 [0, 1.0], 满分 1.0 表示 5 因子全部触发.
+    对应本地: signals.score_entry (subjects/subject/backtest/signals.py).
+    本地 runner 不设阈值, 任何 score > 0 即视为候选, 由 rank_top_n 取 top N.
     """
     triggered = get_triggered_signals(factors, p)
     score = 0.0
@@ -357,43 +381,62 @@ def entry_score(factors, p):
 
 
 # ============================================================
-# 5. 出场信号 (对齐本地 prioritize_exit_signals: 按 weight 降序遍历)
+# 5. 出场信号 (5 信号, weight=0 显式禁用)
 # ============================================================
 def _check_exit_signal(sig_name, factors, holding, current_price, p):
-    """
-    单独检查某个出场信号是否触发.
-    current_price: 本地引擎里这是 T-1 收盘价 (作为 "决策时点的当前价")
+    """单独检查某个出场信号是否触发.
+    current_price: 本地引擎里这是 T-1 收盘价 (作为 "决策时点的当前价").
+
+    spec 5 个出场信号:
+    - fixed_stop:        current_price < entry_price * (1 - fixed_stop_pct)
+    - trailing_stop:     current_price < highest_close * (1 - trailing_stop_pct)
+    - trend_reversal:    ma_10 < ma_30       (weight=0, 显式禁用, 此处仍实现)
+    - time_stop:         holding_days >= max_holding_days
+    - rsi_overbought:    rsi_14 > rsi_overbought
     """
     entry_price = holding["entry_price"]
     highest_close = holding.get("highest_close", entry_price)
     holding_days = holding.get("holding_days", 0)
 
-    if sig_name == "rsi_overbought_stop":
+    if sig_name == "fixed_stop":
+        return current_price < entry_price * (1 - p["fixed_stop_pct"])
+
+    elif sig_name == "trailing_stop":
+        return current_price < highest_close * (1 - p["trailing_stop_pct"])
+
+    elif sig_name == "trend_reversal":
+        # spec: ma_10 < ma_30 (短期均线跌破中期均线, 趋势反转)
+        # 注: weight=0, 实际不会被 should_exit 检查, 但实现保留以便调试或调整
+        ma_10 = factors.get("ma_10")
+        ma_30 = factors.get("ma_30")
+        if ma_10 is not None and ma_30 is not None and not np.isnan(ma_10) and not np.isnan(ma_30):
+            return ma_10 < ma_30
+        return False
+
+    elif sig_name == "time_stop":
+        return holding_days >= p["max_holding_days"]
+
+    elif sig_name == "rsi_overbought":
         rsi_14 = factors.get("rsi_14")
         if rsi_14 is not None and not np.isnan(rsi_14):
             return rsi_14 > p["rsi_overbought"]
-    elif sig_name == "trailing_stop":
-        return current_price < highest_close * (1 - p["trailing_stop_pct"])
-    elif sig_name == "time_stop":
-        return holding_days >= p["max_holding_days"]
-    elif sig_name == "trend_reversal":
-        ma_5 = factors.get("ma_5")
-        ma_20 = factors.get("ma_20")
-        if ma_5 is not None and ma_20 is not None and not np.isnan(ma_5) and not np.isnan(ma_20):
-            return ma_5 < ma_20
-    elif sig_name == "fixed_stop":
-        return current_price < entry_price * (1 - p["fixed_stop_pct"])
+        return False
+
     return False
 
 
 def should_exit(factors, holding, current_price, p):
-    """
-    按 exit_weights 降序遍历, 第一个触发的信号即返回 (短路).
-    对应本地: strategy.should_exit + signals.prioritize_exit_signals.
+    """按 exit_weights 降序遍历, 第一个触发的信号即返回 (短路).
+    对应本地: strategy.should_exit (subjects/<strategy>/generated/strategy.py).
+
+    **weight = 0 才是"显式禁用"语义**: weight == 0 的信号被跳过 (不被检查).
+    本地 strategy.py 不过滤 weight, 但 spec 显式标注 trend_reversal weight=0.0,
+    本脚本按 spec 显式禁用, 与本地"忽略禁用"的微小差异由 spec 显式意图覆盖.
     """
     exit_w = p["exit_weights"]
-    # 按 weight 降序排序信号名
-    for sig in sorted(exit_w, key=exit_w.get, reverse=True):
+    # weight > 0 才参与触发
+    active_sigs = [s for s, w in exit_w.items() if w > 0]
+    for sig in sorted(active_sigs, key=exit_w.get, reverse=True):
         if _check_exit_signal(sig, factors, holding, current_price, p):
             return sig
     return None
@@ -403,8 +446,7 @@ def should_exit(factors, holding, current_price, p):
 # 6. 排序与仓位约束 (1:1 对齐本地 signals.py / portfolio.py)
 # ============================================================
 def rank_top_n(scores, top_n, seed=42):
-    """
-    对应本地 signals.rank_top_n:
+    """对应本地 signals.rank_top_n:
     - 按 score 降序, code 升序 tie-break
     - 同 score 用 random.shuffle(seed) 打乱 (避免每次选同一只)
     """
@@ -423,10 +465,9 @@ def rank_top_n(scores, top_n, seed=42):
 
 
 def enforce_max_single_weight(weights, max_pct):
-    """
-    对应本地 portfolio.enforce_max_single_weight:
+    """对应本地 portfolio.enforce_max_single_weight:
     超出 max_pct 的部分按比例分配给其他未触顶的股票, 最后归一化.
-    """
+    spec: max_pct=0.10 (12 只等权起步 1/12=8.33% < 10%, 通常不会触顶, 但保留约束)."""
     if not weights or max_pct <= 0:
         return weights
     out = {}
@@ -447,17 +488,19 @@ def enforce_max_single_weight(weights, max_pct):
         else:
             for k in out:
                 out[k] = max_pct
+    # 对齐本地 portfolio.enforce_max_single_weight (P3 修复):
+    # 仅当 sum > 1 + 1e-6 (overweight) 时 re-normalize;
+    # sum < 1 时保留 (underweight, 由 fill_cash 补齐), 防止 cap 失效.
     s = _sum(out.values())
-    if s > 0 and abs(s - 1.0) > 1e-6:
+    if s > 1.0 + 1e-6:
         out = {k: v / s for k, v in out.items()}
     return out
 
 
 def enforce_industry_concentration(weights, industry_map, max_pct):
-    """
-    对应本地 portfolio.enforce_industry_concentration:
+    """对应本地 portfolio.enforce_industry_concentration:
     超限行业按比例缩放, 触发缩放后归一化.
-    """
+    spec: max_pct=0.30 (高分散要求)."""
     if not weights or max_pct <= 0:
         return weights
     industry_total = {}
@@ -478,17 +521,18 @@ def enforce_industry_concentration(weights, industry_map, max_pct):
         if scale[ind] < 1.0:
             any_scaled = True
     if any_scaled:
+        # 对齐本地 portfolio.enforce_industry_concentration (P3 修复):
+        # 仅当 sum > 1 + 1e-6 时 re-normalize; sum < 1 时保留.
         s = _sum(out.values())
-        if s > 0 and abs(s - 1.0) > 1e-6:
+        if s > 1.0 + 1e-6:
             out = {k: v / s for k, v in out.items()}
     return out
 
 
 def enforce_max_turnover(current, target, max_pct):
-    """
-    对应本地 portfolio.enforce_max_turnover:
+    """对应本地 portfolio.enforce_max_turnover:
     换手率 = Σ|target - current| / 2, 超限按比例混合 current 与 target.
-    """
+    spec: max_pct=0.30 (低换手, 中期波段特征)."""
     if not target:
         return target
     all_codes = set(current.keys()) | set(target.keys())
@@ -496,7 +540,6 @@ def enforce_max_turnover(current, target, max_pct):
     if turnover <= max_pct:
         return target
     # 缩放: target' = current * (1 - alpha) + target * alpha
-    # 其中 alpha = max_pct / turnover
     alpha = max_pct / turnover if turnover > 0 else 1.0
     out = {}
     for c in all_codes:
@@ -505,10 +548,84 @@ def enforce_max_turnover(current, target, max_pct):
         mixed = cw + alpha * (tw - cw)
         if mixed > 1e-9:
             out[c] = mixed
-    # 归一化
+    # 对齐本地 portfolio.enforce_max_turnover: 本地不 re-normalize,
+    # 保留 sum < 1 (underweight) 由 fill_cash 补齐; 仅 overweight 时缩放.
     s = _sum(out.values())
-    if s > 0 and abs(s - 1.0) > 1e-6:
+    if s > 1.0 + 1e-6:
         out = {k: v / s for k, v in out.items()}
+    return out
+
+
+def fill_cash_with_remaining_candidates(
+    target_weights, scores, target_n, max_single,
+    industry_map=None, max_industry=1.0,
+    cash_threshold=0.01, max_n_multiplier=2.0,
+):
+    """对应本地 portfolio.fill_cash_with_remaining_candidates (P3 #9/#11 修复):
+    当 industry / turnover 约束把 target_weights 缩到 sum < 1, 用剩余候选股
+    按 score 降序填满 cash 沉淀, 直至 sum 接近 1.
+
+    Args:
+        target_weights: 当前 target (可能 sum < 1, 由 enforce 缩放后留下)
+        scores: 所有有 score 的候选股 (含持仓, 与本地 runner:1279 一致)
+        target_n: 目标持仓数
+        max_single: 单票最大权重 (0.10)
+        industry_map: {code: industry_code} (None 时不 enforce 行业)
+        max_industry: 行业最大权重 (0.30)
+        cash_threshold: 触发 fill 的 cash 阈值 (默认 1%)
+        max_n_multiplier: 持仓数上限倍数 (默认 2 × target_n, 即 ≤ 24 只)
+
+    Returns:
+        调整后 target_weights (sum 严格 ≤ 1)
+    """
+    if not scores or not target_weights:
+        return target_weights
+
+    leftover = 1.0 - _sum(target_weights.values())
+    if leftover < cash_threshold:
+        return target_weights
+
+    in_target = set(target_weights.keys())
+    candidates = sorted(
+        [(c, s) for c, s in scores.items() if c not in in_target and s > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    out = dict(target_weights)
+    max_n = int(target_n * max_n_multiplier)
+
+    for code, _score in candidates:
+        if len(out) >= max_n:
+            break
+        leftover = 1.0 - _sum(out.values())
+        if leftover < cash_threshold:
+            break
+
+        new_w = leftover  # 理想 = leftover (加完 sum=1)
+
+        # cap 单票
+        if max_single > 0 and new_w > max_single:
+            new_w = max_single
+
+        # enforce 行业
+        if industry_map is not None and max_industry < 1.0:
+            ind = industry_map.get(code, "unknown")
+            current_ind_total = _sum(
+                w for c, w in out.items()
+                if industry_map.get(c, "unknown") == ind
+            )
+            ind_room = max_industry - current_ind_total
+            if ind_room <= 0:
+                continue
+            if new_w > ind_room:
+                new_w = ind_room
+
+        if new_w < cash_threshold:
+            continue
+
+        out[code] = new_w
+
     return out
 
 
@@ -520,26 +637,18 @@ def should_rebalance(bar_index, freq):
 
 
 # ============================================================
-# 7. A 股规则: ST/北交所过滤 + 一字板判定
+# 7. A 股规则: ST/北交所过滤 + 行业映射 + 一字板判定
 # ============================================================
 def _is_bj(stock):
-    """是否北交所. 代码以 4 / 8 / 92 开头 (含 .BJ 后缀的)."""
+    """是否北交所. 代码以 4 / 8 / 92 开头 (含 .BJ 后缀的).
+    HS300 不包含北交所股票, 但 filter_universe 仍做兜底过滤以防 get_index_stocks 返回异常."""
     bare = stock.split(".")[0]
     return bare.startswith(("4", "8", "92"))
 
 
 def filter_universe(raw_list, context):
-    """
-    过滤候选池: 只剔除北交所. HS300 成员本身稳定 (大盘股, ST 极少, 都已上市 60+ 天).
-
-    设计原因:
-    - 聚宽 09:30 触发时 cd.paused 对所有股票默认 True (尚未连续竞价), 不可靠
-    - cd.is_st 字段在 09:30 也可能不准
-    - 数据缺失股票会在 calc_factors_batch 中自动跳过 (数据完整性检查)
-    - 停牌/涨停股票会在 _do_rebalance 买入时 fallback 到 T-1 close, 或 order 失败后跳过
-
-    因此 universe 过滤只做最基础的代码前缀过滤, 后续自然处理.
-    """
+    """过滤候选池: 只剔除北交所.
+    HS300 由 get_index_stocks 获取, 本身不包含北交所和 ST 股票, 这里只做兜底."""
     out = []
     skip_bj = 0
     for s in raw_list:
@@ -553,11 +662,9 @@ def filter_universe(raw_list, context):
 
 
 def get_industry_map(stock_list, date=None):
-    """
-    获取股票-行业映射 (申万一级 sw_l1).
+    """获取股票-行业映射 (申万一级 sw_l1).
     传 date 参数可拿历史日期的行业映射, 对齐本地 load_industry_map 行为
-    (本地 load_industry_map 读 data-by-day 历史快照, 不是当前时点).
-    """
+    (本地读 data-by-day 历史快照, 不是当前时点)."""
     if not stock_list:
         return {}
     try:
@@ -576,33 +683,32 @@ def get_industry_map(stock_list, date=None):
     return out
 
 
-def _is_one_word_up(d):
-    """一字涨停: 振幅<0.5% + 涨停. 不能买."""
-    if d is None or d.high_limit <= 0 or d.last_price <= 0:
-        return False
-    # 涨停且无振幅 → 一字
-    if d.last_price >= d.high_limit - 0.01:
-        # 振幅近似: (high - low) / prev_close, 这里用 paused 状态判
-        # 聚宽 get_current_data 没有 amplitude, 用 last/limit 近似一字
-        return True
-    return False
-
-
 def can_buy_at_open(d, stock):
-    """T 日开盘能否买入. 极简版: 让 order() 自然处理一切异常.
-
-    设计原因:
-    - 聚宽 09:30 触发时 d.paused / d.is_st 字段不可靠 (尚未连续竞价)
-    - 涨停时 order() 返回 Order 但 filled=0, _execute_buy 中检查可识别
-    - 真正停牌的股票 order() 会返回 None, _execute_buy 中也能识别
-
-    所以这里直接放行, 由 _execute_buy 的下单结果决定实际能否买入.
+    """T 日开盘能否买入. 检查涨停 (last_price >= high_limit) 防止废单.
+    本地 can_buy_at_open 等价检查 bar.low == bar.high == limit_price (一字板).
+    JQ 09:30 时 d.paused / d.is_st 不可靠, 但 d.high_limit / d.last_price 仍可用.
+    注: d.high_limit = 0 表示无涨跌幅限制 (如新股上市首日), 此时不阻拦.
     """
+    if d is None:
+        return False
+    # 涨停: 不能买入 (避免废单)
+    if d.high_limit > 0 and d.last_price is not None and d.last_price > 0:
+        if d.last_price >= d.high_limit - 0.01:
+            return False
     return True
 
 
 def can_sell_at_open(d, stock):
-    """T 日开盘能否卖出. 极简版: 总是返回 True, 由 order() 自然处理."""
+    """T 日开盘能否卖出. 检查跌停 (last_price <= low_limit) 防止废单.
+    本地 can_sell_at_open 等价检查 bar.low == bar.high == limit_price.
+    注: d.low_limit = 0 表示无涨跌幅限制, 此时不阻拦.
+    """
+    if d is None:
+        return False
+    # 跌停: 不能卖出 (避免废单)
+    if d.low_limit > 0 and d.last_price is not None and d.last_price > 0:
+        if d.last_price <= d.low_limit + 0.01:
+            return False
     return True
 
 
@@ -610,14 +716,13 @@ def can_sell_at_open(d, stock):
 # 8. 主循环 daily_handle (09:30 触发, 等价本地 _run_weight 主循环)
 # ============================================================
 def daily_handle(context):
-    """
-    09:30 触发的主循环, 严格对齐本地 _run_weight 单根 K 线处理流程:
+    """09:30 触发的主循环, 严格对齐本地 _run_weight 单根 K 线处理流程:
 
-    bar_idx=1 (第一天): 跳过所有交易, 只记初始化 (对齐本地 if bar_idx == 1: continue)
+    bar_idx=1 (第一天): 跳过所有交易, 只记初始化
     bar_idx>1:
       step 1: 用 T-1 收盘价更新所有持仓的 highest_close 和 holding_days
-      step 2: 刷新 universe (剔除 ST / 北交所 / 上市<60日)
-      step 3: 计算所有候选/持仓股票的 T-1 因子
+      step 2: 刷新 universe (HS300 T-1 快照 + 行业映射)
+      step 3: 计算所有候选/持仓股票的 T-1 因子 + entry_score
       step 4: 出场决策 (用 T-1 因子, T 开盘成交)
       step 5: 调仓 (is_rebalance 时, 选 top N → enforce_xxx → 调仓)
     """
@@ -638,7 +743,7 @@ def daily_handle(context):
         return
 
     # ---- step 1: 用 T-1 收盘价更新 highest_close + holding_days += 1 ----
-    # (本次回调在 T 09:30, T-1 已收盘, 可用 attribute_history(1) 拿 T-1 close)
+    # 09:30 触发时 T-1 已收盘, attribute_history(1) 拿 T-1 close
     # 注: holding_days 累加是交易日计数, 不是日历日
     for stock in list(g.holdings.keys()):
         h = g.holdings[stock]
@@ -656,8 +761,9 @@ def daily_handle(context):
         h["holding_days"] += 1   # 每个交易日 +1 (对齐本地 update_after_bar)
 
     # ---- step 2: 刷新 universe ----
-    # 固定股票池模式: 直接用 FIXED_UNIVERSE (HS300 + CYB_STAR_50, 共 356 只)
-    # 对应本地 _resolve_universe 行为, 避免 HS300 成分股每天动态变化导致回测结果不稳定
+    # 固定测试集模式: 直接用 FIXED_UNIVERSE (HS300 + CYB_STAR_50, 356 只)
+    # 对应本地 _resolve_universe(["HS300", "CYB_STAR_50"]) 行为
+    # 固定池避免 HS300 调样带来的回测结果不稳定 (年 5-10 次调样)
     if p.get("use_fixed_universe", False):
         raw = list(FIXED_UNIVERSE)
     else:
@@ -668,18 +774,19 @@ def daily_handle(context):
             log.warn("获取 universe 失败: %s" % str(e))
             raw = []
     g.universe = filter_universe(raw, context)
-    # 传 context.previous_date: 拿 T-1 历史快照的行业映射, 对齐本地 load_industry_map(universe, date_str)
+    # 传 context.previous_date: 拿 T-1 历史快照的行业映射, 对齐本地 load_industry_map
     g.industry_map = get_industry_map(g.universe, date=context.previous_date)
 
     # ---- step 3: 批量计算所有股票的 T-1 因子 + entry_score ----
-    # 用 calc_factors_batch (history 批量 API) 替代 300+ 次 attribute_history 调用
     factors_by_code = calc_factors_batch(g.universe, context, n=100)
-    scores = {}  # 只给非持仓股票算 score (避免重复入场)
+    # scores 必须含**所有**股票 (包括持仓), 对齐本地 runner.py:1275-1280:
+    # - 入场只加 score > 0 的 (rank_top_n 会再过滤)
+    # - 持仓的 score 决定它是否仍在 top N → 是否被换掉 ("留赢家, 卖输家")
+    scores = {}
     for stock, f in factors_by_code.items():
-        if stock not in g.holdings:
-            s = entry_score(f, p)
-            if s > 0:
-                scores[stock] = s
+        s = entry_score(f, p)
+        if s > 0:
+            scores[stock] = s
 
     # 持仓股不在 g.universe (比如已被移出 HS300) 时, 单独算因子
     # 确保出场决策对所有持仓都生效, 避免僵尸持仓
@@ -688,6 +795,8 @@ def daily_handle(context):
             f = calc_factors_t1(stock, context, n=100)
             if f is not None:
                 factors_by_code[stock] = f
+                if entry_score(f, p) > 0:
+                    scores[stock] = entry_score(f, p)
 
     log.info("候选池 %d 只, 通过 entry_score>0 的 %d 只 (持仓 %d 只)" % (
              len(g.universe), len(scores), len(g.holdings)))
@@ -716,55 +825,67 @@ def daily_handle(context):
 
 
 # ============================================================
-# 9. 调仓 (rebalance) (对齐本地 _run_weight step 4)
+# 9. 调仓 _do_rebalance (12 只 + 等权 + 3 约束 + fill_cash)
 # ============================================================
 def _do_rebalance(scores, factors_by_code, context):
-    """
-    严格按本地 weight 模式调仓:
-    1. rank_top_n 选 target_holdings 只
-    2. 等权 weight = 1/target_n
-    3. enforce_max_single_weight (单票<=40%)
-    4. enforce_industry_concentration (行业<=50%)
-    5. enforce_max_turnover (换手<=50%)
-    6. 卖出不在 target 的; 买入新进 target 的; 不重新分配已持仓的权重
+    """调仓流程 (与本地 _run_weight step 4 等价):
+    1. rank_top_n 选 target_holdings=12 只
+    2. 等权 weight = 1/12 ≈ 8.33% (起始)
+    3. enforce_max_single_weight (单票<=10%, 通常不触顶)
+    4. enforce_industry_concentration (行业<=30%, 高分散要求)
+    5. enforce_max_turnover (换手<=30%, 中期波段低换手)
+    6. fill_cash_with_remaining_candidates (用剩余候选补齐 cash 沉淀, 最多 24 只)
+    7. 卖出不在 target 的; 买入新进 target 的; 不重新分配已持仓的权重
     """
     p = g.params
-    target_n = p["target_holdings"]
-    max_single = p["max_single_weight"]
-    max_industry = p["max_industry_concentration"]
-    max_turnover = p["max_turnover_per_rebalance"]
+    target_n = p["target_holdings"]               # 12
+    max_single = p["max_single_weight"]            # 0.10
+    max_industry = p["max_industry_concentration"] # 0.30
+    max_turnover = p["max_turnover_per_rebalance"] # 0.30
 
     if not scores and not g.holdings:
         log.info("无候选且无持仓, 跳过调仓")
         return
 
-    # ---- 1. 选 top N ----
+    # ---- 1. 选 top N (scores 含所有股票, 含持仓) ----
     top_codes = rank_top_n(scores, target_n, seed=p["tie_break_seed"])
     if not top_codes:
-        # 对齐本地 runner._run_weight 的 `if top_codes:` 块:
-        # 当无 score>0 候选时, 整个调仓块都不执行, 持仓保持不变.
+        # 无 score>0 候选时, 整个调仓块都不执行, 持仓保持不变.
         # 这避免了弱市/震荡市无信号时全部清仓的副作用.
         log.info("无 score>0 候选, 跳过调仓 (持仓保持不变, 对齐本地行为)")
         return
 
-    # ---- 2. 等权 target_weights ----
+    # ---- 2. 等权 target_weights (起始) ----
     target_weights = {c: 1.0 / target_n for c in top_codes}
 
-    # ---- 3-4. 应用约束 ----
+    # ---- 3-5. 应用约束链 (single → industry → turnover) ----
     target_weights = enforce_max_single_weight(target_weights, max_single)
     target_weights = enforce_industry_concentration(target_weights, g.industry_map,
                                                      max_industry)
     current_weights = _compute_current_weights(context)
     target_weights = enforce_max_turnover(current_weights, target_weights, max_turnover)
 
-    log.info("rebalance: top_n=%d, target_weights=%d" %
-             (len(top_codes), len(target_weights)))
+    # ---- 6. fill_cash: 用剩余候选股填满 industry/turnover 留下的 cash 沉淀 ----
+    try:
+        target_weights = fill_cash_with_remaining_candidates(
+            target_weights=target_weights,
+            scores=scores,
+            target_n=target_n,
+            max_single=max_single,
+            industry_map=g.industry_map,
+            max_industry=max_industry,
+        )
+    except Exception as e:
+        log.warn("fill_cash 失败: %s" % str(e))
 
-    # ---- 5. 计算 total_value (用 T-1 close 估值, 避免用 T 开盘价改变估值基准) ----
+    log.info("rebalance: top_n=%d, target_weights=%d, sum=%.4f" %
+             (len(top_codes), len(target_weights), _sum(target_weights.values())))
+
+    # ---- 计算 total_value (用 T 开盘价估, 含现金) ----
     total_value = _compute_total_value(context)
     cd = get_current_data()
 
-    # ---- 6. 卖出不在 target 的持仓 ----
+    # ---- 7. 卖出不在 target 的持仓 ----
     for stock in list(g.holdings.keys()):
         if stock in target_weights:
             continue
@@ -775,7 +896,7 @@ def _do_rebalance(scores, factors_by_code, context):
             continue
         _execute_sell(stock, h, "rebalance_out", context)
 
-    # ---- 7. 买入新进的 ----
+    # ---- 8. 买入新进的 ----
     for stock, weight in target_weights.items():
         if stock in g.holdings:
             continue  # 已持仓, 不重新调整 (本地引擎不重平衡持仓 weight)
@@ -785,7 +906,6 @@ def _do_rebalance(scores, factors_by_code, context):
             continue
 
         # 获取下单价: 优先 d.last_price (实时价), fallback 到 factors["close"] (T-1 收盘价)
-        # 原因: 聚宽 09:30 时 d.last_price 可能为 0 (尚未撮合), 用 T-1 close 作为近似
         open_px = 0
         if d is not None and d.last_price is not None and d.last_price > 0:
             open_px = float(d.last_price)
@@ -799,8 +919,10 @@ def _do_rebalance(scores, factors_by_code, context):
             continue
 
         amount = total_value * weight
-        shares = int(amount / open_px / 100) * 100
-        if shares < 100:
+        # 科创板 (688) 最低 200 股/手, 其他板块 100 股/手
+        lot_size = 200 if stock.startswith("688") else 100
+        shares = int(amount / open_px / lot_size) * lot_size
+        if shares < lot_size:
             continue
         # 获取触发的入场信号 (用于 entry_signals 记录)
         triggered = get_triggered_signals(factors_by_code.get(stock, {}), p)
@@ -808,7 +930,7 @@ def _do_rebalance(scores, factors_by_code, context):
 
 
 def _compute_current_weights(context):
-    """计算当前持仓的 weight (用 T-1 收盘价或最新可得价估值)."""
+    """计算当前持仓的 weight (用 T 开盘价或 T-1 close 估值, 含现金)."""
     out = {}
     total = 0.0
     cd = get_current_data()
@@ -840,8 +962,7 @@ def _compute_total_value(context):
 # 10. 买卖执行 (对齐本地 Portfolio.buy / Portfolio.sell)
 # ============================================================
 def _execute_buy(stock, open_px, shares, triggered_signals, context):
-    """
-    执行买入. 对齐本地 Portfolio.buy:
+    """执行买入. 对齐本地 Portfolio.buy:
     - 含费 entry_price = (amount + fee) / shares
     - 不足整百自动向下取整
     - 现金不足 → 放弃
@@ -852,8 +973,7 @@ def _execute_buy(stock, open_px, shares, triggered_signals, context):
         return
 
     amount = open_px * shares
-    # 买入费 = max(amount * 0.0003, 5)
-    fee = _max(amount * 0.0003, 5)
+    fee = _max(amount * 0.0003, 5)  # 买入费 = max(amount * 0.0003, 5)
     total_cost = amount + fee
 
     if total_cost > context.portfolio.available_cash:
@@ -866,7 +986,8 @@ def _execute_buy(stock, open_px, shares, triggered_signals, context):
         limit_price = _min(open_px * 1.005, 9999.99)
         order_result = order(stock, shares, LimitOrderStyle(limit_price))
     else:
-        order_result = order(stock, shares)  # 用 order(股数) 而不是 order_value, 确保成交股数确切
+        # 用 order(股数) 而不是 order_value, 确保成交股数确切
+        order_result = order(stock, shares)
 
     if order_result is None:
         log.info("下单失败 (可能涨停/停牌): %s" % stock)
@@ -888,7 +1009,11 @@ def _execute_buy(stock, open_px, shares, triggered_signals, context):
         "entry_price": effective_entry,
         "entry_date": context.current_dt,
         "highest_close": open_px,
-        "holding_days": 0,
+        # holding_days 1-based (对齐本地 runner P3 修复, subjects/subject/backtest/portfolio.py:142):
+        # buy 设 hd=1, 下一交易日 step 1 +=1 → hd=2, 第 N 个交易日 end-of-day hd=N
+        # time_stop (max=45) 触发: hd=45 在 buy 日 + 44
+        # 旧版用 hd=0 会让 time_stop 晚 1 天触发, 与本地不一致
+        "holding_days": 1,
         "shares": actual_shares,
         "entry_signals": list(triggered_signals),
         "prev_close": open_px,
@@ -898,8 +1023,7 @@ def _execute_buy(stock, open_px, shares, triggered_signals, context):
 
 
 def _execute_sell(stock, holding, exit_signal, context):
-    """
-    执行卖出全部持仓. 对齐本地 Portfolio.sell:
+    """执行卖出全部持仓. 对齐本地 Portfolio.sell:
     - 卖出净额 = amount - fee 加入现金
     - PnL = (open_px - effective_entry) * shares - sell_fee
     """
@@ -911,7 +1035,6 @@ def _execute_sell(stock, holding, exit_signal, context):
     if d is not None and d.last_price is not None and d.last_price > 0:
         open_px = float(d.last_price)
     else:
-        # Fallback: 用持仓状态中缓存的 prev_close 或 entry_price
         open_px = float(holding.get("prev_close") or holding.get("entry_price") or 0)
 
     if open_px <= 0 or np.isnan(open_px):
@@ -925,8 +1048,8 @@ def _execute_sell(stock, holding, exit_signal, context):
     # 科创板限价单
     if stock.startswith("688"):
         limit_price = _max(open_px * 0.995, 0.01)
-        if limit_price >= 10000:
-            limit_price = 9999.99
+        # 与买入端对齐: 卖出也加 9999.99 上限保护 (极端高价/退市残留价)
+        limit_price = _min(limit_price, 9999.99)
         order_result = order(stock, -shares, LimitOrderStyle(limit_price))
     else:
         order_result = order_target_value(stock, 0)
@@ -946,13 +1069,15 @@ def _execute_sell(stock, holding, exit_signal, context):
 
 
 # ============================================================
-# 11. 固定股票池 FIXED_UNIVERSE (HS300 + CYB_STAR_50)
+# 11. 固定测试集 FIXED_UNIVERSE (from data/config.py HS300 + CYB_STAR_50)
 # ============================================================
-# 来源: D:/my-auto-quant/data/config.py
-#   - HS300 = 沪深 300 (300 只)
-#   - CYB_STAR_50 = 创业板 50 + 科创板 50 (100 只)
-# 合并去重 + 排除北交所 = 356 只
+# 数据源: D:/project/quant/my-quant3/data/config.py (最后更新 2026-06-01)
+#   - HS300: 沪深 300 成分股 (300 只, 6 位纯数字)
+#   - CYB_STAR_50: 创业板 50 + 科创板 50 (100 只, 6 位纯数字)
+# 合并去重 + 排除北交所 (4/8/92 开头) = 356 只
+# JQ 格式转换: 0/2/3 开头 → .XSHE (深交所), 6/9 开头 → .XSHG (上交所)
 # 与本地 _resolve_universe(["HS300", "CYB_STAR_50"]) 完全等价
+# 固定池目的: 跨期可比, 避免 HS300 调样导致回测结果不可复现
 # ============================================================
 FIXED_UNIVERSE = [
     "000001.XSHE", "000002.XSHE", "000063.XSHE", "000100.XSHE", "000157.XSHE",
@@ -1028,3 +1153,67 @@ FIXED_UNIVERSE = [
     "688617.XSHG", "688702.XSHG", "688728.XSHG", "688777.XSHG", "688981.XSHG",
     "689009.XSHG",
 ]
+
+
+# ============================================================
+# 12. 自检 (RULES.md §7 要求, 启动前检查 PARAMS 与本地对齐)
+# ============================================================
+def self_check():
+    """启动前自检 PARAMS, 触发 0 笔交易或差距大时优先看这里."""
+    p = PARAMS
+    issues = []
+
+    # 必填字段
+    for key in ["target_holdings", "max_single_weight", "max_industry_concentration",
+                "max_turnover_per_rebalance", "rebalance_freq_days",
+                "entry_weights", "exit_weights", "tie_break_seed"]:
+        if key not in p:
+            issues.append("PARAMS 缺少必填字段: %s" % key)
+
+    if p.get("tie_break_seed") != 42:
+        issues.append("tie_break_seed 应为 42 (与本地 rank_top_n 对齐)")
+
+    for sig, w in p.get("entry_weights", {}).items():
+        if w <= 0:
+            issues.append("entry_weights[%s] = %s, 应 > 0" % (sig, w))
+
+    # spec 特化检查
+    if p.get("target_holdings") != 12:
+        issues.append("spec 调优后 target_holdings=12, 当前=%s" % p.get("target_holdings"))
+    if p.get("max_single_weight") != 0.10:
+        issues.append("spec 调优后 max_single_weight=0.10, 当前=%s" % p.get("max_single_weight"))
+    if p.get("max_industry_concentration") != 0.30:
+        issues.append("spec 调优后 max_industry_concentration=0.30, 当前=%s" % p.get("max_industry_concentration"))
+    if p.get("max_turnover_per_rebalance") != 0.30:
+        issues.append("spec 调优后 max_turnover_per_rebalance=0.30, 当前=%s" % p.get("max_turnover_per_rebalance"))
+    if p.get("mom_lookback") != 60:
+        issues.append("spec 定义 mom_60, mom_lookback 应为 60, 当前=%s" % p.get("mom_lookback"))
+
+    # 5 入场信号权重和应为 1.0
+    ew_sum = _sum(p.get("entry_weights", {}).values())
+    if abs(ew_sum - 1.0) > 1e-6:
+        issues.append("entry_weights 总和 = %.4f, 应为 1.0" % ew_sum)
+
+    # 5 出场信号应该有 trend_reversal=0.0 (显式禁用)
+    if "trend_reversal" not in p.get("exit_weights", {}):
+        issues.append("exit_weights 缺 trend_reversal 键 (spec 显式标注, 即使禁用也应保留)")
+    elif p["exit_weights"].get("trend_reversal", -1) != 0.0:
+        issues.append("exit_weights.trend_reversal 应为 0.0 (显式禁用), 当前=%s" %
+                      p["exit_weights"]["trend_reversal"])
+
+    # FIXED_UNIVERSE 完整性检查 (来自 data/config.py HS300+CYB_STAR_50 合并去重应得 356 只)
+    fu_count = len(FIXED_UNIVERSE)
+    if p.get("use_fixed_universe") and fu_count != 356:
+        issues.append("FIXED_UNIVERSE 数量=%d, 预期 356 (HS300=300 + CYB_STAR_50=100, 去重后)" % fu_count)
+    if p.get("use_fixed_universe") and fu_count < 300:
+        # 严重问题: 数量低于 HS300 单一池, 几乎肯定是源数据缺失
+        issues.append("FIXED_UNIVERSE 数量异常少 (%d), 请重新从 data/config.py 同步" % fu_count)
+
+    if issues:
+        log.warn("=== PARAMS 自检发现 %d 个问题 ===" % len(issues))
+        for i in issues:
+            log.warn("  - " + i)
+    else:
+        log.info("=== PARAMS 自检通过 (5 入场信号权重和=%.2f, 12 只持仓, 固定测试集 %d 只) ==="
+                 % (ew_sum, fu_count))
+    return len(issues) == 0

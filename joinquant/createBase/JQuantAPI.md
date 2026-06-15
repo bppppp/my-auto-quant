@@ -1797,3 +1797,120 @@ for stock, value in target_weights.items():
 
 跑出 0 笔交易时,按 §17.5 checklist 逐项定位。
 
+### 17.12 ⚠️ `template_trend_momentum_strategy_1.py` 只是参考,不是模板
+
+> **本节是 2026-06 从 `multi_factor_trend_swing` 移植中得到的惨痛教训**。
+> `createBase/template_trend_momentum_strategy_1.py` 是**已对齐的标杆实现**,但它是**为 trend_momentum_strategy_1 这一个策略设计的**,有大量该策略特有的元素。**严禁**把它当"通用模板"逐章套用到其他策略。
+
+#### 17.12.1 模板里哪些是"通用约定"可以借,哪些是"策略特有"必须改
+
+| 类别 | 是否可借 | 原因 |
+|---|---|---|
+| `from jqdata import *` 后的 `_sum/_max/_min` 别名 | ✅ 可借 | 聚宽环境通用 |
+| `run_daily(daily_handle, time="09:30")` 单一调度 | ✅ 可借 | T-1 严格无前视约定 |
+| `g.bar_index` 累加 + `if bar_idx == 1: return` | ✅ 可借 | 与本地 runner 对齐 |
+| `enforce_max_single_weight` / `enforce_industry_concentration` / `enforce_max_turnover` | ✅ 可借 | 通用 5 仓位约束 |
+| `fill_cash_with_remaining_candidates` | ✅ 可借 | 通用现金沉淀填补 |
+| 09:30 时 `cd.paused / cd.is_st` 不可靠 | ✅ 可借 | 平台特性 |
+| `attribute_history(..., fq="pre")` 显式前复权 | ✅ 可借 | 平台特性 |
+| **docstring 措辞** (如"多指标共振趋势策略") | ❌ **必须改** | 每个策略的"策略定位"不同 |
+| **FIXED_UNIVERSE = HS300 + CYB_STAR_50 (356 只)** | ⚠️ **按 spec 决定** | 模板用的是 trend_momentum 的 universe, 其他策略可能用 HS300 单独 / 动态池 / 完全不同的列表 |
+| **入场信号 1 个 (单 AND 触发)** | ❌ **必须改** | multi_factor_trend_swing 是 5 信号加权,ma_cross 是单信号金叉,donchian 是突破,每个策略入场结构都不同 |
+| **出场信号 5 个 + weight 排序** | ⚠️ **按 spec 决定** | 信号名 / 触发条件 / weight 都来自 spec,模板里的具体值不能照抄 |
+| **PARAMS 字段** (target_holdings / max_single / max_industry / max_turnover / 因子窗口 / 阈值) | ❌ **必须改** | 完全策略特定 |
+| **holding_days 起始值 0 vs 1** | ⚠️ **按本地 P3 修复** | 见 §17.12.3 |
+
+#### 17.12.2 套模板破坏策略本意的 3 个真实案例 (从 multi_factor_trend_swing 移植中学到)
+
+**案例 1: universe 错位**
+- spec 写 `test_universe: HS300`,实际意图是 HS300 单独
+- 模板的 `FIXED_UNIVERSE` 是 HS300 + CYB_STAR_50 (356 只), 直接套用会把**多出 56 只**非 spec 标的进候选池
+- 后果:科创板 200 股规则被无意识触发,引入 spec 没说过的交易成本,回测结果与本地 runner 不一致
+- **正确做法**:从 `D:\project\quant\my-quant3\data\config.py` 取 `HS300` 单独或 `["HS300", "CYB_STAR_50"]`,看 spec 怎么写
+
+**案例 2: exit_weights 多余信号**
+- spec 5 个出场信号,模板的 `exit_weights` 有 5 个键
+- 但"按优先级凑齐"时会无意识塞一个 spec 里没有的占位信号(如 `atr_filter_exit`)
+- 后果:`should_exit` 优先级链条凭空插一档,触发分布错位
+- **正确做法**:`should_exit` 的 `_check_exit_signal` 实现必须严格按 spec 的 5 个 (或 N 个) 信号,一个不多一个不少
+
+**案例 3: 策略本质差异被"形似"掩盖**
+- trend_momentum 是"7×40% 集中",spec 是"12×10% 高分散"
+- 即使 PARAMS 数字对了,章节 docstring 还在说"等权 1/7,cap 到 40%",没体现"12×10% 等权起步后被三约束链压"的真实意图
+- 后果:后人读代码理解策略时,会被章节 docstring 误导
+- **正确做法**:每个章节 docstring 写这个**当前策略**的语义,不是模板的通用描述
+
+#### 17.12.3 holding_days 起始值的"对齐陷阱"
+
+这是最隐蔽的偏差,容易在"以为对齐了"时翻车:
+
+| 本地 runner (P3 修复后) | 模板 (旧版习惯) | 后果 |
+|---|---|---|
+| `buy()` 设 `hd=1` (1-based) | `buy()` 设 `hd=0` (0-based) | time_stop 晚 1 天触发 |
+| 第 1 个交易日 end-of-day: `hd=1` | 第 1 个交易日 step 1 后: `hd=1` | (同) |
+| 第 N 个交易日 end-of-day: `hd=1+(N-1)=N` | 第 N 个交易日 step 1 后: `hd=0+N=N` | (同) |
+| **time_stop (max=45) 触发: buy 日 + 44** | **time_stop 触发: buy 日 + 45** | **差 1 个交易日** |
+
+模板沿用了"旧版 hd=0 + step 1 +=1"的写法,看起来"也对",但**与本地 P3 修复后的 `buy()` 直接设 `hd=1` 不一致**。time_stop 是按"实际持有天数"设计的,晚 1 天会显著影响 time_stop 触发频次,长期累积影响年化收益和胜率。
+
+**正确做法**:`_execute_buy` 中显式设 `"holding_days": 1`,并在 docstring 写明"对齐本地 P3 修复 (subjects/subject/backtest/portfolio.py:142)"。
+
+#### 17.12.4 正确的移植流程
+
+```text
+1. 读 spec 完整 (final.md + narrative)
+   ↓
+2. 提炼策略本质:
+   - 策略类型 (动量 / 波段 / 反转 / 套利)
+   - universe (固定 / 动态 / 混合)
+   - 入场结构 (单 AND / 多信号加权 / score 排名)
+   - 持仓周期 (短期 / 中期 / 长期)
+   - 调仓频率 + 5 仓位约束参数
+   ↓
+3. 从模板只借"通用约定" (见 17.12.1 表的 ✅ 行)
+   ↓
+4. 重新设计章节 docstring 体现"当前策略"语义
+   ↓
+5. 严格按 spec 实现:
+   - 因子 (数量 / 窗口 / 计算公式)  ← 改
+   - 入场信号 (名称 / 触发 / 权重)  ← 改
+   - 出场信号 (名称 / 触发 / 权重)  ← 改
+   - PARAMS 全部字段  ← 改
+   - universe  ← 改
+   ↓
+6. 对照 `createBase/weight-rules.md` 走 9.x checklist
+   ↓
+7. 跑 self_check() 确认 PARAMS 必填字段 + spec 调优值
+   ↓
+8. 跑本地 runner 与 JQ 脚本,对比首日 / 首次 rebalance / 出场分布
+```
+
+#### 17.12.5 反例: "复制模板 → 改 4 个数字 → 上线"
+
+这是**最高频的错误**。具体症状:
+
+- ✅ 11 章节结构对
+- ✅ 5 仓位约束函数对
+- ✅ 9:30 单一调度对
+- ❌ docstring 还说"多指标共振趋势策略"(trend_momentum 特有)
+- ❌ `FIXED_UNIVERSE` 还是 356 只
+- ❌ `entry_score` 还是单信号 AND
+- ❌ `exit_weights` 多了一个 spec 没有的占位
+- ❌ `holding_days` 还是 0 (与本地 P3 修复不一致)
+- ❌ 章节 docstring 描述的是"7×40% 集中"语义,不是当前策略的"12×10% 高分散"
+
+跑出来回测结果**与本地 runner 偏差 5-15%**,但排查时每个章节"看起来都对",不知道哪里出了问题。
+
+**教训**:每个策略的 JQ 脚本应该是**该策略的独立实现**,不是"模板的派生"。
+
+#### 17.12.6 跨文档引用
+
+| 文档 | 用途 |
+|---|---|
+| `createBase/weight-rules.md` §5.1 | holding_days 1-based 详细说明 + P3 修复背景 |
+| `createBase/weight-rules.md` §1.3 | bar_idx 1-based 详细说明 + 修正 `should_rebalance` docstring 误导 |
+| `createBase/weight-rules.md` §6.3 | `can_buy/sell_at_open` 涨停/跌停判断 + 卖跌停废单问题 |
+| `joinQuant/RULES.md` §3 | "新策略存放" + 章节命名 + "只改 1/3/4/5 章节"的边界 |
+
+> **一句话原则**:`template_*.py` 是"已对齐的标杆实现",`weight-rules.md` 是"对接规范",`JQuantAPI.md` 是"API + 实战坑"。三者**互为补充**,但**不能互相替代**。移植新策略时,**spec 是主,模板是辅,规则文档是底线**。
+
