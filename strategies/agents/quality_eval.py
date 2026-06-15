@@ -67,14 +67,14 @@ _EVAL_DIMS = (
 )
 _MAX_SCORE_PER_DIM = 10
 _TOTAL_MAX = len(_EVAL_DIMS) * _MAX_SCORE_PER_DIM  # 60
-_PASS_THRESHOLD = 0.85  # 85% (用户决策 2026-06-08 调整,从 90% 改为 85%)
+_PASS_THRESHOLD = 0.80  # 80% 阈值 (用户决策 2026-06-13)
 
 
 def _judge_hard_gates(eval_result: dict) -> dict:
     """根据 soft_evaluation 6 维总分判定通过。
 
-    规则(用户决策 2026-06-08):
-      通过条件 = 6 维总分 >= 51/60(85%)
+    规则(用户决策 2026-06-13):
+      通过条件 = 6 维总分 >= 48/60(80%)
       不通过 → passed=false(并标注实际得分/满分)
     """
     soft = eval_result.get("soft_evaluation", {})
@@ -114,14 +114,14 @@ def _judge_hard_gates(eval_result: dict) -> dict:
         log_print(f"[quality_eval]   {status} {dim:30s} {s:5.1f}/10  {bar}")
     log_print(
         f"[quality_eval] 总分: {total:5.1f}/{_TOTAL_MAX}  "
-        f"({ratio*100:5.1f}%) {'≥' if passed else '<'} 85% 阈值  →  "
+        f"({ratio*100:5.1f}%) {'≥' if passed else '<'} 80% 阈值  →  "
         f"{'PASS ✓' if passed else 'FAIL ✗'}"
     )
 
     # 在 summary 末尾追加分数信息,便于上层反馈给 LLM
     suffix = (
         f"\n\n[quality_eval 阈值] 总分 {total:.1f}/{_TOTAL_MAX} "
-        f"= {ratio * 100:.1f}%{' ≥' if passed else ' <'} 85% 阈值"
+        f"= {ratio * 100:.1f}%{' ≥' if passed else ' <'} 80% 阈值"
         f" → {'pass' if passed else 'fail'}"
     )
     eval_result["summary"] = (eval_result.get("summary", "") + suffix).strip()

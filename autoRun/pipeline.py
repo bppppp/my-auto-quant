@@ -1,16 +1,15 @@
 """
 my-quant3 autoRun 流水线主入口
 
-完整流程: A 生成 → B 翻译 → T top300 筛选 → C params 20 轮 → D 选最优 →
+完整流程: A 生成 → B 翻译 → C params 20 轮 → D 选最优 →
           E weight 20 轮 → F 选最优 → H 导出到 result/ → G 下一策略
 
 Usage:
   python pipeline.py check-env                          # 检查环境
-  python pipeline.py --batch 5 --params-rounds 20 --weight-rounds 20
+  python pipeline.py --batch 5 --params-rounds 20 --weight-rounds 20 --reset   
   python pipeline.py --reset --batch 5 --params-rounds 20 --weight-rounds 20 清空重新来
   python pipeline.py --strategy ma_cross_atr_volume     # 单策略
   python pipeline.py --from-stage B                    # 从某阶段开始
-  python pipeline.py --from-stage T                     # 从 top300 开始 (跳过翻译)
   python pipeline.py --reset                            # 清空 state.json
   python pipeline.py --dry-run                          # 只显示计划
 """
@@ -66,7 +65,6 @@ from autoRun.pipeline.state import (  # noqa: E402
     STAGE_PARAMS_LOOP,
     STAGE_PICKED_PARAMS,
     STAGE_PICKED_WEIGHT,
-    STAGE_TOP300,
     STAGE_TRANSLATED,
     STAGE_WEIGHT_DONE,
     STAGE_WEIGHT_LOOP,
@@ -365,162 +363,14 @@ def run_stage_b_translate(name: str, config: PipelineConfig) -> Path:
     return result.code_path
 
 
-# ========== Stage T: top300 测试集筛选 ==========
-
-def _compute_top300_date_range(lookback_years: int) -> tuple[str | None, str | None]:
-    """从 data-by-day/ 扫出 end_date, start = end - lookback_years*365 天.
-
-    复用 BacktestRunner._apply_default_date_range_5y 的扫描逻辑 (按年目录 + 文件名
-    YYYY-MM-DD_金玥数据.csv 提取日期), 但 years 由调用方控制. 拿不到日期时返回
-    (None, None), 让 runner 走 5y 默认.
-
-    Args:
-        lookback_years: 回看年数 (>= 1)
-
-    Returns:
-        (start_date, end_date) 字符串 YYYY-MM-DD, 或 (None, None)
-    """
-    if lookback_years < 1:
-        return None, None
-    root = project_root() / "data" / "data-by-day"
-    if not root.exists():
-        return None, None
-    all_dates: list[str] = []
-    for year_dir in sorted(root.iterdir()):
-        if not year_dir.is_dir():
-            continue
-        year = year_dir.name
-        for f in year_dir.iterdir():
-            if f.suffix == ".csv" and f.stem.startswith(f"{year}-"):
-                all_dates.append(f.stem.split("_")[0])
-    if not all_dates:
-        return None, None
-    all_dates.sort()
-    end_str = all_dates[-1]
-    import pandas as _pd  # 局部导入, 避免顶层强依赖
-    end_ts = _pd.Timestamp(end_str)
-    start_ts = end_ts - _pd.Timedelta(days=365 * lookback_years)
-    return start_ts.strftime("%Y-%m-%d"), end_str
-
-
-def run_stage_t_top300(name: str, config: PipelineConfig, state: State) -> None:
-    """Stage T: 全量回测筛选最优 300 只股票作为测试集.
-
-    在 strategiesParam/v1.md 存在后调用，调 subject.cli run-top300，
-    结果写入 test_universe/top300.md。
-    后续 Stage C/D/E/F 的回测自动使用这个测试集（subject.cli 会读取它）。
-
-    设计为幂等：若 top300.md 已存在则跳过。
-    """
-    top300_path = subjects_dir() / name / "test_universe" / "top300.md"
-    if top300_path.exists():
-        log.info(f"  → test_universe/top300.md 已存在, 跳过 top300 (幂等)")
-        state.set_stage(name, STAGE_TOP300)
-        state.save()
-        return
-
-    # 计算滚动窗口: 以 data-by-day 末日为 end, start = end - lookback_years 年
-    start_date, end_date = _compute_top300_date_range(config.top300_lookback_years)
-    if start_date and end_date:
-        log.info(
-            f"  → top300 窗口: {start_date} ~ {end_date} "
-            f"(data 末日往前推 {config.top300_lookback_years} 年, 覆盖 runner 默认 5y)"
-        )
-    else:
-        log.warning(
-            f"  ⚠️ 无法从 data-by-day/ 推算日期窗口, "
-            f"回退到 runner 5y 默认 (start={start_date}, end={end_date})"
-        )
-
-    log.info(f"  → top300 筛选 ({config.top300_rounds} 轮, limit={config.top300_limit or '不限'}, timeout={config.top300_timeout or '无限制'}s)")
-    timeout_str = f"{config.top300_timeout}s" if config.top300_timeout else "无限制"
-    cmd = [
-        sys.executable, "-u", "-m", "subject.cli.main",
-        "run-top300",
-        "--strategy", name,
-        "--rounds", str(config.top300_rounds),
-    ]
-    if config.top300_limit is not None:
-        cmd += ["--limit", str(config.top300_limit)]
-    if start_date:
-        cmd += ["--start-date", start_date]
-    if end_date:
-        cmd += ["--end-date", end_date]
-    log.info(f"    $ {' '.join(cmd)}  (cwd=subjects/, timeout={timeout_str})")
-
-    import time as _time
-    proc = subprocess.Popen(
-        cmd, cwd=subjects_dir(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        shell=False, bufsize=1,
-    )
-    _register_subprocess(proc)
-    try:
-        deadline = _time.time() + config.top300_timeout if config.top300_timeout else float("inf")
-        chunks: list[str] = []
-        last_report = _time.time()
-
-        while True:
-            if _time.time() > deadline:
-                log.error(f"    ❌ top300 超时 ({config.top300_timeout}s), 强杀")
-                proc.kill()
-                raise RuntimeError(f"top300 超时 {config.top300_timeout}s")
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                chunks.append(line)
-                stripped = line.strip()
-                if any(kw in stripped.lower() for kw in ("top300", "round", "回测", "完成", "成功", "失败", "写入", "最优")):
-                    log.info(f"    | {stripped[:200]}")
-            if _time.time() - last_report > 300:
-                log.info(f"    ⏳ top300 仍在跑, pid={proc.pid}")
-                last_report = _time.time()
-            if proc.poll() is not None:
-                if proc.stdout:
-                    rest = proc.stdout.read()
-                    if rest:
-                        chunks.append(rest)
-                break
-            _time.sleep(0.5)
-
-        full = "".join(chunks)
-        my_pid = proc.pid
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-
-        if proc.returncode != 0:
-            log.error(f"    ❌ top300 exit {proc.returncode}, 最后 20 行:")
-            for ln in full.splitlines()[-20:]:
-                log.error(f"        {ln}")
-            raise RuntimeError(f"top300 exit {proc.returncode}")
-        log.info(f"    ✅ top300 完成, 总输出 {len(full)} 字符")
-
-        # 验证 top300.md 是否真的写出来了
-        if not top300_path.exists():
-            raise RuntimeError(f"top300 命令退出 0 但 {top300_path} 未生成")
-        log.info(f"  → top300.md 已写入 ({top300_path})")
-    finally:
-        _unregister_subprocess(proc)
-        _cleanup_stray_processes(name)
-
-    state.set_stage(name, STAGE_TOP300)
-    state.save()
-
-
 # ========== Stage C: params 调优 20 轮 ==========
 
 def run_stage_c_params_loop(name: str, config: PipelineConfig, state: State) -> None:
     """Stage C: params 调优 N 轮."""
-    log.info(f"  → params 调优 {config.params_rounds} 轮")
-    # 使用与 smoke test 相同的日期范围
-    start_date = config.smoke_start
-    end_date = config.smoke_end
+    log.info(f"  → params 调优 {config.params_rounds} 轮 (日期: {config.backtest_start} ~ {config.backtest_end})")
+    # 使用 backtest 范围 (与 smoke test 区分: smoke 验证能用, backtest 用于调优)
+    start_date = config.backtest_start
+    end_date = config.backtest_end
     for round_n in range(1, config.params_rounds + 1):
         log.info(f"  [params {round_n}/{config.params_rounds}]")
         try:
@@ -597,10 +447,10 @@ def run_stage_e_weight_loop(name: str, config: PipelineConfig, state: State) -> 
     if not weight_v1.exists():
         log.warning(f"  ⚠️ weight_v1.md 不存在, 回退到 Stage D (重新复制 best params)")
         run_stage_d_pick_best_params(name, config, state)
-    log.info(f"  → weight 调优 {config.weight_rounds} 轮 (v1 是 best params 副本)")
-    # 使用与 smoke test 相同的日期范围
-    start_date = config.smoke_start
-    end_date = config.smoke_end
+    log.info(f"  → weight 调优 {config.weight_rounds} 轮 (v1 是 best params 副本, 日期: {config.backtest_start} ~ {config.backtest_end})")
+    # 使用 backtest 范围 (与 smoke test 区分)
+    start_date = config.backtest_start
+    end_date = config.backtest_end
     for round_n in range(1, config.weight_rounds + 1):
         log.info(f"  [weight {round_n}/{config.weight_rounds}]")
         try:
@@ -854,7 +704,7 @@ def parse_latest(name: str, mode: str) -> dict:
 
 # ========== 主循环 ==========
 
-STAGE_ORDER = ["A", "B", "T", "C", "D", "E", "F", "H"]
+STAGE_ORDER = ["A", "B", "C", "D", "E", "F", "H"]
 
 
 def main_loop(args, config: PipelineConfig) -> int:
@@ -937,8 +787,6 @@ def run_one_stage(stage: str, name: str, config: PipelineConfig, state: State) -
     elif stage == "B":
         run_stage_b_translate(name, config)
         state.set_stage(name, STAGE_TRANSLATED)
-    elif stage == "T":
-        run_stage_t_top300(name, config, state)
     elif stage == "C":
         run_stage_c_params_loop(name, config, state)
     elif stage == "D":
@@ -964,8 +812,7 @@ def current_stage_letter(stage: str) -> str:
     mapping = {
         "init": "A",
         "generated": "B",
-        "translated": "T",    # B 完成后进入 top300 筛选
-        "top300": "C",        # top300 完成后进入 params 调优
+        "translated": "C",    # B 完成后进入 params 调优
         "params_loop": "C",
         "params_done": "D",
         "picked_params": "E",
@@ -1067,7 +914,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 默认 (无子命令) 跑流水线
     parser.add_argument("--batch", type=int, default=None, help="一次跑几个策略 (覆盖 config)")
     parser.add_argument("--strategy", default=None, help="只跑指定策略")
-    parser.add_argument("--from-stage", default=None, choices=["A", "B", "T", "C", "D", "E", "F", "H"], help="从某阶段开始")
+    parser.add_argument("--from-stage", default=None, choices=["A", "B", "C", "D", "E", "F", "H"], help="从某阶段开始")
     parser.add_argument("--params-rounds", type=int, default=None, help="params 调优轮数 (覆盖 config)")
     parser.add_argument("--weight-rounds", type=int, default=None, help="weight 调优轮数 (覆盖 config)")
     parser.add_argument("--translate-max", type=int, default=None, help="翻译重试上限 (覆盖 config)")
@@ -1080,11 +927,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cli-timeout", type=int, default=None, help="optimize/factor_weights timeout (秒, 默认 1800/30m, 0=禁用)")
     parser.add_argument("--backtest-timeout", type=int, default=None, help="单次回测 timeout (秒, 默认 3600/1h, 0=禁用)")
     parser.add_argument("--smoke-timeout", type=int, default=None, help="翻译 smoke backtest timeout (秒, 默认 600/10m)")
-    parser.add_argument("--top300-timeout", type=int, default=None, help="top300 每轮 timeout (秒, 默认 14400/4h, 0=禁用)")
-    parser.add_argument("--top300-rounds", type=int, default=None, help="top300 调优轮数 (默认 3)")
-    parser.add_argument("--top300-limit", type=int, default=None, help="top300 每轮最多测 N 只股票 (默认不限, 调试建议 50-100)")
-    parser.add_argument("--top300-lookback-years", type=int, default=None,
-                        help="top300 滚动回看年数 (默认 2, 覆盖 runner 5y 默认; 以 data-by-day 末日为 end 往前推)")
+    parser.add_argument("--backtest-start", default=None, help="params/weight backtest 起始日期 YYYY-MM-DD (默认 2019-01-01)")
+    parser.add_argument("--backtest-end", default=None, help="params/weight backtest 结束日期 YYYY-MM-DD (默认 2023-12-31)")
 
     # check-env 子命令
     sub.add_parser("check-env", help="检查环境是否就绪")
@@ -1118,14 +962,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides["backtest_timeout"] = args.backtest_timeout if args.backtest_timeout > 0 else None
     if args.smoke_timeout is not None:
         overrides["smoke_timeout"] = args.smoke_timeout
-    if args.top300_timeout is not None:
-        overrides["top300_timeout"] = args.top300_timeout if args.top300_timeout > 0 else None
-    if args.top300_rounds is not None:
-        overrides["top300_rounds"] = args.top300_rounds
-    if args.top300_limit is not None:
-        overrides["top300_limit"] = args.top300_limit
-    if args.top300_lookback_years is not None:
-        overrides["top300_lookback_years"] = args.top300_lookback_years
+    if args.backtest_start is not None:
+        overrides["backtest_start"] = args.backtest_start
+    if args.backtest_end is not None:
+        overrides["backtest_end"] = args.backtest_end
     config = PipelineConfig(**overrides) if overrides else PipelineConfig()
 
     if args.dry_run:
@@ -1136,6 +976,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  translate_max_attempts: {config.translate_max_attempts}")
         print(f"  result_dir: {config.result_dir}")
         print(f"  smoke_universe: {config.smoke_universe}")
+        print(f"  smoke_date:     {config.smoke_start} ~ {config.smoke_end}")
+        print(f"  backtest_date:  {config.backtest_start} ~ {config.backtest_end}")
         # 各阶段 timeout
         def _fmt(t):
             if t is None:
@@ -1147,16 +989,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  cli_timeout:         {_fmt(config.cli_timeout)}")
         print(f"  backtest_timeout:    {_fmt(config.backtest_timeout)}")
         print(f"  smoke_timeout:       {_fmt(config.smoke_timeout)}")
-        print(f"  top300_rounds:      {config.top300_rounds} 轮")
-        print(f"  top300_limit:      {config.top300_limit or '不限'}")
-        print(f"  top300_timeout:     {_fmt(config.top300_timeout)}")
-        print(f"  top300_lookback_years: {config.top300_lookback_years} 年")
-        # 实际跑时 start/end 由 _compute_top300_date_range 算, 这里也展示一份方便对照
-        s, e = _compute_top300_date_range(config.top300_lookback_years)
-        if s and e:
-            print(f"  top300 日期范围:    {s} ~ {e}  (data 末日往前推 {config.top300_lookback_years} 年)")
-        else:
-            print(f"  top300 日期范围:    (无法从 data-by-day/ 推算, 走 runner 5y 默认)")
         return 0
 
     banner("my-quant3 pipeline 启动", char="=")
