@@ -10,6 +10,7 @@ pipeline.config — 流水线运行时配置
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,8 +53,14 @@ class PipelineConfig:
     smoke_universe: tuple[str, ...] = (
         "000001.SZ", "000002.SZ", "600000.SH", "600519.SH", "000333.SZ",
     )
-    smoke_start: str = "2024-06-01"
-    smoke_end: str = "2024-12-31"
+    smoke_start: str = "2021-01-01"
+    smoke_end: str = "2025-12-31"
+
+    # Stage C (params) + Stage E (weight) backtest 日期范围
+    # 与 smoke 区分: smoke 验证策略能跑, backtest 用于参数/权重调优
+    # 用户决策 2026-06-13: 默认 2019-2023 (5 年)
+    backtest_start: str = "2019-01-01"
+    backtest_end: str = "2023-12-31"
 
     # ===== 各阶段 subprocess timeout (秒) =====
     # Stage A (generate) 包含 quality_eval,可能需要 1 - 5 小时
@@ -65,12 +72,6 @@ class PipelineConfig:
     backtest_timeout: int | None = 3600       # 1 小时 (用户确认)
     # 翻译阶段 smoke backtest (5 只股票, 1 个月)
     smoke_timeout: int = 600                  # 10 分钟
-
-    # Stage T (top300) 全量回测筛选 (全量股票 × 5 年 × rounds 轮)
-    # 每轮耗时约 1-4 小时, None 表示不设超时 (依赖 Ctrl+C)
-    top300_timeout: int | None = 14400        # 4 小时 (默认每轮上限)
-    top300_rounds: int = 1                   # 调优轮数 (每轮 LLM 调参 + 全量回测)
-    top300_limit: int | None = None          # 每轮最多测 N 只股票 (None=不限/全量, 调试建议设 50-100)
 
     # 路径 (相对项目根, 可被 CLI 覆盖)
     result_dir: Path = field(default=None)  # type: ignore

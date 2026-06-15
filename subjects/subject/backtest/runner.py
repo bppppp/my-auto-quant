@@ -604,6 +604,9 @@ class BacktestRunner:
             if self.end_date:
                 df = df[df["日期"] <= pd.Timestamp(self.end_date)]
             df = df.sort_values("日期").reset_index(drop=True)
+            # 过滤北交所股票 + ST 股票
+            df = exclude_bj(df)
+            df = exclude_st(df)
             if len(df) < min_bars:
                 skipped_too_few += 1
                 continue
@@ -745,6 +748,9 @@ class BacktestRunner:
                 warmup_df = full_df[full_df["日期"] >= warmup_start]
                 if len(warmup_df) >= warmup_days:
                     df = warmup_df.sort_values("日期").reset_index(drop=True)
+                    # 热启动后过滤北交所 + ST 股票
+                    df = exclude_bj(df)
+                    df = exclude_st(df)
                     # === 修复: warmup 后重新绑定因子缓存 ===
                     # 否则 factor cache 长度(不含 warmup) 与 df长度(含 warmup) 不匹配,
                     # 导致 try_get_cached_factor 每次都 miss 并打印 warning.

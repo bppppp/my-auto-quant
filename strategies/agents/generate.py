@@ -181,7 +181,7 @@ def _pick_weakest_dimension(soft_eval: dict) -> str:
 def _format_quality_eval_feedback(eval_result: dict, *, attempt: int = 1) -> str:
     """把 quality_eval 失败转成 user_prompt 末尾的反馈。
 
-    通过条件: 6 维总分 >= 51/60(85%, 见 quality_eval._PASS_THRESHOLD)。
+    通过条件: 6 维总分 >= 48/60(80%, 见 quality_eval._PASS_THRESHOLD)。
     不通过则展示按 gap 降序的每维分数 + 弱维度 issues + 修复模板,引导 LLM 改进。
 
     Args:
@@ -229,7 +229,7 @@ def _format_quality_eval_feedback(eval_result: dict, *, attempt: int = 1) -> str
     ratio = eval_result.get("_quality_ratio", 0)
     lines.append(
         f"| **总分** | **{total:.1f}** | **{total_max}** | "
-        f"**{ratio*100:.1f}% < 85% 阈值** |"
+        f"**{ratio*100:.1f}% < 80% 阈值** |"
     )
     lines.append("")
 
@@ -259,7 +259,7 @@ def _format_quality_eval_feedback(eval_result: dict, *, attempt: int = 1) -> str
     lines.append("### 提升方向")
     lines.append("- 重点关注分数最低的维度(差距最大)")
     lines.append("- error 级 issue 必须修复,否则该维度分数无法提升")
-    lines.append(f"- 修复后总分需达到 {int(total_max * 0.85)}/{total_max}(85%,见 quality_eval._PASS_THRESHOLD)才算通过")
+    lines.append(f"- 修复后总分需达到 {int(total_max * 0.80)}/{total_max}(80%,见 quality_eval._PASS_THRESHOLD)才算通过")
     lines.append("")
     lines.append(f"### summary\n{eval_result.get('summary', '')}")
     lines.append("\n请按上述反馈重新输出完整 JSON。")
@@ -274,14 +274,14 @@ def run_generate(*, max_retries: int = 5) -> Path:
       - 内层 N 次重试(_run_generate_once 内):一次完整流程内的 LLM/parse/校验/eval 重试
         (含硬校验失败 + quality_eval 失败,都加反馈让 LLM 改进)
 
-    通过条件(quality_eval):6 维总分 >= 51/60(85%,见 quality_eval._PASS_THRESHOLD)。
+    通过条件(quality_eval):6 维总分 >= 48/60(80%,见 quality_eval._PASS_THRESHOLD)。
 
     Returns:
         写入的 <name>_v1.md 路径
     """
     rt = RuntimeSettings.from_env()
     banner("模式 1: generate 启动")
-    log_print(f"[generate] 目标: 生成新策略,直到通过 quality_eval 85% 阈值(51/60)")
+    log_print(f"[generate] 目标: 生成新策略,直到通过 quality_eval 80% 阈值(48/60)")
     log_print(f"[generate] 每轮内 LLM 重试上限: {max_retries} (env: SELF_EVAL_MAX_RETRIES)")
     log_print(f"[generate] LLM: model=见配置, temperature=0.3, think=True")
     log_print(f"[generate] 日志文件: strategies/log/run.log(同时落盘)")
@@ -412,7 +412,7 @@ def _run_generate_once(*, max_retries: int, round_no: int) -> Path:
                 f"[generate] ✗ quality_eval 未通过: "
                 f"{eval_result.get('_quality_total', 0):.1f}/"
                 f"{eval_result.get('_quality_total_max', 60)} = "
-                f"{eval_result.get('_quality_ratio', 0)*100:.1f}% < 85% 阈值"
+                f"{eval_result.get('_quality_ratio', 0)*100:.1f}% < 80% 阈值"
             )
             feedback_md = _format_quality_eval_feedback(eval_result, attempt=attempt)
             last_error = ValueError(
@@ -423,7 +423,7 @@ def _run_generate_once(*, max_retries: int, round_no: int) -> Path:
             f"[generate] ✓ quality_eval 通过: "
             f"{eval_result.get('_quality_total', 0):.1f}/"
             f"{eval_result.get('_quality_total_max', 60)} = "
-            f"{eval_result.get('_quality_ratio', 0)*100:.1f}% ≥ 85% 阈值"
+            f"{eval_result.get('_quality_ratio', 0)*100:.1f}% ≥ 80% 阈值"
         )
 
         # 写盘
