@@ -810,6 +810,56 @@ if stock.startswith("688"):
 但若遇到极端情况 (退市残留/异常高价/数据错误), 9999.99 上限可避免 order 被聚宽拒为"价格超限".
 
 
+### 6.8 ⚠️ 停牌/一字板处理: 取消交易 (skip), 不允许 fallback 到 T-1 close
+
+**核心规则**: 当 T 日开盘价不可用 (停牌/一字板/未撮合导致 `last_price=0` 或 `开盘价=NaN/0`), **必须取消当日该笔交易**, **不允许**:
+- 用 T-1 收盘价 (factors["close"]) 兜底 → 会产生"幽灵成交"
+- 用 entry_price / prev_close 兜底 → 同上
+
+**错误实现** (T-1 close 兜底, 会用昨日价格成交):
+```python
+open_px = 0
+if d is not None and d.last_price is not None and d.last_price > 0:
+    open_px = float(d.last_price)
+else:
+    f = factors_by_code.get(stock)
+    if f is not None and f.get("close") and f["close"] > 0:
+        open_px = float(f["close"])   # ← 错误! 兜底到 T-1 close
+```
+
+**正确实现** (直接跳过, 记录 skipped 事件):
+```python
+# 买入
+open_px = 0
+if d is not None and d.last_price is not None and d.last_price > 0:
+    open_px = float(d.last_price)
+
+if open_px <= 0 or np.isnan(open_px):
+    log.info("%s T 开盘价不可用 (停牌/一字板/未撮合), 跳过买入" % stock)
+    continue   # ← 正确: 不交易
+
+# 卖出同样
+open_px = 0
+if d is not None and d.last_price is not None and d.last_price > 0:
+    open_px = float(d.last_price)
+
+if open_px <= 0 or np.isnan(open_px):
+    log.warn("价格异常 (停牌/一字板), 跳过卖出: %s" % stock)
+    return   # ← 正确: 持仓继续持有, 下一可交易日再卖
+```
+
+**本地对应**: `runner.py` 三处 (买入 line 1423, exit 卖出 line 1304, 调仓卖出 line 1388):
+```python
+open_px_raw = bar_series.get("开盘价")
+if open_px_raw is None or pd.isna(open_px_raw) or float(open_px_raw) <= 0:
+    continue  # 跳过, 不成交
+```
+
+**为什么是高坑?** 停牌股用 T-1 close 成交等于"昨日价格买入", 后续一旦复牌会跳空,
+PnL 计算失真; 一字涨停股用 T-1 close 成交等于"按涨停前一天的价格抢跑买入", 完全规避了涨停约束.
+这两种情况都属于"系统层绕过 A 股规则", 长期累积会显著高估收益.
+
+
 ---
 
 ## 7. 聚宽环境陷阱 (与本地差异源)

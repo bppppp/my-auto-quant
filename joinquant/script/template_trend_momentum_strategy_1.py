@@ -901,18 +901,14 @@ def _do_rebalance(scores, factors_by_code, context):
             log.info("%s 买入信号但 T 开盘无法买入" % stock)
             continue
 
-        # 获取下单价: 优先 d.last_price (实时价), fallback 到 factors["close"] (T-1 收盘价)
-        # 原因: 聚宽 09:30 时 d.last_price 可能为 0 (尚未撮合), 用 T-1 close 作为近似
+        # 获取下单价: 优先 d.last_price (T 09:30 撮合价)
+        # 停牌/一字板/last_price 不可用时, 直接跳过, 不用 T-1 close 兜底 (避免幽灵成交)
         open_px = 0
         if d is not None and d.last_price is not None and d.last_price > 0:
             open_px = float(d.last_price)
-        else:
-            f = factors_by_code.get(stock)
-            if f is not None and f.get("close") and f["close"] > 0:
-                open_px = float(f["close"])
 
         if open_px <= 0 or np.isnan(open_px):
-            log.info("%s 价格异常 (last_price 和 T-1 close 均无效), 跳过" % stock)
+            log.info("%s T 开盘价不可用 (停牌/一字板/未撮合), 跳过买入" % stock)
             continue
 
         amount = total_value * weight
@@ -1028,16 +1024,14 @@ def _execute_sell(stock, holding, exit_signal, context):
     cd = get_current_data()
     d = cd.get(stock)
 
-    # 获取卖出价: 优先 d.last_price, fallback 到持仓的 prev_close (T-1 收盘价)
+    # 获取卖出价: 优先 d.last_price (T 09:30 撮合价)
+    # 停牌/一字板/last_price 不可用时, 直接跳过, 不用 T-1 close 兜底 (避免幽灵成交)
     open_px = 0
     if d is not None and d.last_price is not None and d.last_price > 0:
         open_px = float(d.last_price)
-    else:
-        # Fallback: 用持仓状态中缓存的 prev_close 或 entry_price
-        open_px = float(holding.get("prev_close") or holding.get("entry_price") or 0)
 
     if open_px <= 0 or np.isnan(open_px):
-        log.warn("价格异常, 跳过卖出: %s" % stock)
+        log.warn("价格异常 (停牌/一字板), 跳过卖出: %s" % stock)
         return
 
     shares = holding["shares"]

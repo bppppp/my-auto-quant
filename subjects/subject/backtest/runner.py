@@ -1301,7 +1301,11 @@ class BacktestRunner:
                     continue
                 pos = portfolio.positions[code]
                 bar_series = day_data[code]
-                open_px = float(bar_series["开盘价"])
+                open_px_raw = bar_series.get("开盘价")
+                # 停牌/一字板/开盘价缺失时, 跳过 (不卖, 延后到下一可交易日)
+                if open_px_raw is None or pd.isna(open_px_raw) or float(open_px_raw) <= 0:
+                    continue
+                open_px = float(open_px_raw)
                 close = float(bar_series["收盘价"])
                 prev_close = prev_close_by_code[code]
 
@@ -1385,7 +1389,11 @@ class BacktestRunner:
                                 bar_series = day_data[code]
                                 prev_close = prev_close_by_code[code]
                                 if can_sell_at_open(bar_series, prev_close, code):
-                                    open_px = float(bar_series["开盘价"])
+                                    open_px_raw = bar_series.get("开盘价")
+                                    # 停牌/一字板/开盘价缺失时, 跳过 (延后到下一可交易日)
+                                    if open_px_raw is None or pd.isna(open_px_raw) or float(open_px_raw) <= 0:
+                                        continue
+                                    open_px = float(open_px_raw)
                                     # PnL 需扣 sell_fee (同 exit 卖出)
                                     sell_amount = open_px * pos.shares
                                     pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
@@ -1420,10 +1428,19 @@ class BacktestRunner:
                                 "reason": "limit_up_at_open", "pnl": None, "holding_days": None,
                             })
                             continue
+                        # 停牌/一字板/开盘价缺失时, 跳过 (不用 T-1 close 兜底, 避免幽灵成交)
                         open_px = float(bar_series["开盘价"])
+                        if open_px <= 0 or pd.isna(open_px):
+                            all_events.append({
+                                "code": code, "signal": "entry", "action": "skipped",
+                                "reason": "suspended_or_invalid_open", "pnl": None, "holding_days": None,
+                            })
+                            continue
                         amount = tv * weight
-                        shares = int(amount / open_px / 100) * 100
-                        if shares > 0:
+                        # 688 科创板最小 200 股/手, 其他板块 100 股/手 (A 股规则)
+                        lot_size = 200 if code.startswith("688") else 100
+                        shares = int(amount / open_px / lot_size) * lot_size
+                        if shares >= lot_size:
                             # 获取触发入场的信号列表（调用策略方法）
                             if code in factors_by_code:
                                 triggered_signals = self.strategy.get_triggered_signals(

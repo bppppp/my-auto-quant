@@ -8,11 +8,12 @@
 """
 from __future__ import annotations
 
-# 费率 (小数)
-_BUY_COMMISSION_RATE = 0.00025
-_TRANSFER_FEE_RATE = 0.00001  # 沪市过户费
-_SELL_STAMP_TAX_RATE = 0.001
-_MIN_COMMISSION = 5.0  # 元
+# 费率 (小数) — 跟 JQ 模板对齐
+# JQ OrderCost 不收过户费, 本地也对齐不收 (跟 createBase/weight-rules.md §6.8 配套)
+_BUY_COMMISSION_RATE = 0.00025  # 佣金 万 2.5 (JQ 万 3, 本地略低, 无影响)
+# _TRANSFER_FEE_RATE = 0.00001   # 沪市过户费 万 0.1 (已禁用, 跟 JQ 对齐)
+_SELL_STAMP_TAX_RATE = 0.001    # 印花税 千 1
+_MIN_COMMISSION = 5.0           # 元 (跟 JQ 一致)
 
 
 def _commission(amount: float) -> float:
@@ -31,8 +32,7 @@ def calc_buy_fee(amount: float, code: str) -> float:
         总费用 (元), 含佣金 + 沪市过户费 (如适用).
     """
     fee = _commission(amount)
-    if code.endswith(".SH"):
-        fee += amount * _TRANSFER_FEE_RATE
+    # 过户费已禁用 (跟 JQ 对齐)
     return fee
 
 
@@ -44,10 +44,9 @@ def calc_sell_fee(amount: float, code: str) -> float:
         code: 带后缀代码.
 
     Returns:
-        总费用 (元), 含佣金 + 沪市过户费 + 卖出印花税.
+        总费用 (元), 含佣金 + 卖出印花税.
     """
     fee = _commission(amount)
-    if code.endswith(".SH"):
-        fee += amount * _TRANSFER_FEE_RATE
+    # 过户费已禁用 (跟 JQ 对齐)
     fee += amount * _SELL_STAMP_TAX_RATE
     return fee
