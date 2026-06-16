@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ._paths import DATA_ROOT
+from ._paths import DAY_DIR, DAY_FILE_SUFFIX
 from .preprocess import preprocess
 
 
@@ -25,7 +25,7 @@ def load_day(date: str) -> pd.DataFrame:
 
     Args:
         date: ``YYYY-MM-DD`` 格式交易日.
-            函数会查 ``data-by-day/{YYYY}/{date}_金玥数据.csv``.
+            函数会查 ``{DAY_DIR}/{YYYY}/{date}{DAY_FILE_SUFFIX}``.
 
     Returns:
         DataFrame: 单日全 A, 已执行 5 项预处理. ``df["代码"]`` 列已加交易所后缀.
@@ -34,10 +34,13 @@ def load_day(date: str) -> pd.DataFrame:
         FileNotFoundError: 该日期无对应 CSV 文件.
     """
     year = date[:4]
-    path: Path = DATA_ROOT / "data-by-day" / year / f"{date}_金玥数据.csv"
+    path: Path = DAY_DIR / year / f"{date}{DAY_FILE_SUFFIX}"
     if not path.exists():
         raise FileNotFoundError(f"No data-by-day file for date={date!r}: {path}")
 
     df = pd.read_csv(path, dtype={c: str for c in _STRING_COLS}, keep_default_na=False)
+    for col in df.columns:
+        if col not in _STRING_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     preprocess(df)
     return df

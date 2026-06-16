@@ -27,7 +27,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from .a_share_rules import can_buy, can_buy_at_open, can_sell, can_sell_at_open
-from .data_loader import load_day, load_stock
+from .data_loader import load_day, load_stock, STOCK_DIR, DAY_DIR, STOCK_FILE_PATTERN
 from .fees import calc_buy_fee, calc_sell_fee
 from .log_utils import setup_backtest_logger
 from .metrics import compute_metrics
@@ -636,14 +636,12 @@ class BacktestRunner:
         Returns:
             股票代码列表，如 ["000001.SZ", "000002.SZ", ...]
         """
-        from .data_loader import DATA_ROOT
-        stock_dir = DATA_ROOT / "data-by-stock"
-        if not stock_dir.exists():
+        if not STOCK_DIR.exists():
             return []
         codes = []
-        for f in stock_dir.iterdir():
-            if f.suffix == ".csv" and "_金玥数据" in f.name:
-                # 文件名格式: XXXXXX_金玥数据.csv
+        for f in STOCK_DIR.iterdir():
+            if f.suffix == ".csv":
+                # 兼容新旧格式: 000001.csv (bs) / 000001_金玥数据.csv (gold)
                 code6 = f.stem.split("_")[0]
                 # 根据代码前缀判断交易所
                 if code6.startswith("6"):
@@ -1740,12 +1738,10 @@ class BacktestRunner:
 
     # ===== 日期枚举 =====
     def _enumerate_trading_dates(self) -> list[str]:
-        from .data_loader import DATA_ROOT
-        root = DATA_ROOT / "data-by-day"
-        if not root.exists():
+        if not DAY_DIR.exists():
             return []
         out: list[str] = []
-        for year_dir in sorted(root.iterdir()):
+        for year_dir in sorted(DAY_DIR.iterdir()):
             if not year_dir.is_dir():
                 continue
             year = year_dir.name
@@ -1765,12 +1761,10 @@ class BacktestRunner:
         从 data-by-day/ 枚举所有 CSV 文件的日期, 取最晚一天作为 end, 往前推 5 年作为 start.
         这样能保证跑的是"最近 5 年完整数据", 而不是从 2018 跑到 2026 浪费时间.
         """
-        from .data_loader import DATA_ROOT
-        root = DATA_ROOT / "data-by-day"
-        if not root.exists():
+        if not DAY_DIR.exists():
             return
         all_dates: list[str] = []
-        for year_dir in sorted(root.iterdir()):
+        for year_dir in sorted(DAY_DIR.iterdir()):
             if not year_dir.is_dir():
                 continue
             year = year_dir.name

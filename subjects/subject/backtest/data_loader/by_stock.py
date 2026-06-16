@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ._paths import DATA_ROOT
+from ._paths import STOCK_DIR, STOCK_FILE_SUFFIX
 from .preprocess import preprocess
 
 
@@ -67,11 +67,16 @@ def load_stock(code: str, use_cache: bool = True) -> pd.DataFrame:
                 return _stock_cache[code]
 
     # 磁盘读取
-    path: Path = DATA_ROOT / "data-by-stock" / f"{code}_金玥数据.csv"
+    path: Path = STOCK_DIR / f"{code}{STOCK_FILE_SUFFIX}"
     if not path.exists():
         raise FileNotFoundError(f"No data-by-stock file for code={code!r}: {path}")
 
     df = pd.read_csv(path, dtype={c: str for c in _STRING_COLS}, keep_default_na=False)
+    # 数值列: keep_default_na=False 会导致空字符串留为 "", 使整列变 object
+    # 因此手动 coerce 数值列 (不在 _STRING_COLS 中的列大概率是数值)
+    for col in df.columns:
+        if col not in _STRING_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     preprocess(df)
     df = df.sort_values("日期").reset_index(drop=True)
 

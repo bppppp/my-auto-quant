@@ -922,11 +922,23 @@ def cmd_check_env(_args) -> int:
     data_dir = project_root() / "data"
     if not data_dir.exists():
         warnings.append(f"❌ data/ 不存在 ({data_dir})")
-        warnings.append("   → 回测需要金玥数据, 见 data/README.md §1")
+        warnings.append("   → 回测需要数据, 见 data/README.md")
     else:
-        n_stock = len(list((data_dir / "data-by-stock").glob("*.csv"))) if (data_dir / "data-by-stock").exists() else 0
-        n_day = sum(1 for _ in (data_dir / "data-by-day").glob("*/*_金玥数据.csv")) if (data_dir / "data-by-day").exists() else 0
-        print(f"✅ data/ 存在: {n_stock} 只股票, {n_day} 个横截面文件")
+        # 优先检查 baostock 数据 (DATA_SOURCE=bs), 回退到金玥数据
+        for ds_name, stock_subdir, day_glob in [
+            ("bs", "data-by-stock-bs", "data-by-day-bs/*/*.csv"),
+            ("gold", "data-by-stock", "data-by-day/*/*_金玥数据.csv"),
+        ]:
+            stock_dir = data_dir / stock_subdir
+            n_stock = len(list(stock_dir.glob("*.csv"))) if stock_dir.exists() else 0
+            day_dir = data_dir / day_glob.split("/*")[0]
+            n_day = sum(1 for _ in (data_dir / day_glob.split("/*")[0]).glob(day_glob.split("/", 1)[1])) if day_dir.exists() else 0
+            if n_stock > 0 and n_day > 0:
+                print(f"✅ data/ [{ds_name}] {n_stock} 只股票, {n_day} 个横截面文件")
+                break
+        else:
+            warnings.append("❌ 无可用数据 (data-by-stock-bs/ 和 data-by-stock/ 皆为空)")
+            warnings.append("   → 运行 scripts/generate_baostock_data.py 生成数据")
 
     # 4. 关键模块
     for mod in ["strategies.agents.base_agent", "subject.backtest.runner"]:
@@ -975,8 +987,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cli-timeout", type=int, default=None, help="optimize/factor_weights timeout (秒, 默认 1800/30m, 0=禁用)")
     parser.add_argument("--backtest-timeout", type=int, default=None, help="单次回测 timeout (秒, 默认 3600/1h, 0=禁用)")
     parser.add_argument("--smoke-timeout", type=int, default=None, help="翻译 smoke backtest timeout (秒, 默认 600/10m)")
-    parser.add_argument("--backtest-start", default=None, help="params/weight backtest 起始日期 YYYY-MM-DD (默认 2019-01-01)")
-    parser.add_argument("--backtest-end", default=None, help="params/weight backtest 结束日期 YYYY-MM-DD (默认 2023-12-31)")
+    parser.add_argument("--backtest-start", default=None, help="params/weight backtest 起始日期 YYYY-MM-DD (默认 2018-01-01)")
+    parser.add_argument("--backtest-end", default=None, help="params/weight backtest 结束日期 YYYY-MM-DD (默认 2021-12-31)")
 
     # check-env 子命令
     sub.add_parser("check-env", help="检查环境是否就绪")

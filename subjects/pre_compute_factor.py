@@ -26,6 +26,7 @@ from subject.factors import (  # noqa: E402
     ma, atr, rsi, donchian_high, donchian_low, volume_ratio, mom,
 )
 from subject.backtest.data_loader.by_stock import load_stock  # noqa: E402
+from subject.backtest.data_loader._paths import STOCK_DIR, FACTOR_DIR, STOCK_FILE_SUFFIX, STOCK_FILE_PATTERN  # noqa: E402
 from data.config import HS300, CSI1000, CYB_STAR_50  # noqa: E402
 
 # 公共因子白名单:列名 = 因子函数 + "_" + period
@@ -46,14 +47,14 @@ FACTOR_COLUMNS = [
     ("mom_60", lambda df: mom(df["收盘价"], 60)),
 ]
 
-DATA_ROOT = _PROJECT / "data"
-SOURCE_DIR = DATA_ROOT / "data-by-stock"
-TARGET_DIR = DATA_ROOT / "data-by-stock-factor"
+# 数据路径: 统一从 _paths.py 获取, 跟 DATA_SOURCE 联动
+SOURCE_DIR = STOCK_DIR           # data-by-stock-bs/ 或 data-by-stock/
+TARGET_DIR = FACTOR_DIR          # data-by-stock-factor-bs/ 或 data-by-stock-factor/
 
 
 def compute_one(code: str) -> tuple[bool, str]:
     """计算单只股的 factor CSV, 返回 (success, message)."""
-    src = SOURCE_DIR / f"{code}_金玥数据.csv"
+    src = SOURCE_DIR / f"{code}{STOCK_FILE_SUFFIX}"
     if not src.exists():
         return False, f"source not found: {src.name}"
     dst = TARGET_DIR / f"{code}_factor.csv"
@@ -98,8 +99,8 @@ def list_target_codes() -> list[str]:
 def list_all_codes() -> list[str]:
     """返回 data/data-by-stock/ 下所有股票的 6 位代码 (去重, 排序)."""
     codes: list[str] = []
-    for f in SOURCE_DIR.glob("*_金玥数据.csv"):
-        code = f.stem.replace("_金玥数据", "")
+    for f in SOURCE_DIR.glob(STOCK_FILE_PATTERN):
+        code = f.stem.split("_")[0]  # 兼容 000001.csv 和 000001_金玥数据.csv
         if code.isdigit() and len(code) == 6:
             codes.append(code)
     codes.sort()

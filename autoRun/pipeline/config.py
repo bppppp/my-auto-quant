@@ -58,9 +58,9 @@ class PipelineConfig:
 
     # Stage C (params) + Stage E (weight) backtest 日期范围
     # 与 smoke 区分: smoke 验证策略能跑, backtest 用于参数/权重调优
-    # 用户决策 2026-06-13: 默认 2019-2023 (5 年)
-    backtest_start: str = "2019-01-01"
-    backtest_end: str = "2023-12-31"
+    # 用户决策 2026-06-15: 默认 2018-2021 (4 年)
+    backtest_start: str = "2018-01-01"
+    backtest_end: str = "2021-12-31"
 
     # ===== 各阶段 subprocess timeout (秒) =====
     # Stage A (generate) 包含 quality_eval,可能需要 1 - 5 小时

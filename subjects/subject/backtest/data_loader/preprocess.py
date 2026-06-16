@@ -11,7 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 
-_BOOL_MAP = {"是": True, "否": False, "": False}
+_BOOL_MAP = {"是": True, "否": False, "": False, "True": True, "False": False, "true": True, "false": False}
 
 
 def _add_exchange_suffix(code: str) -> str:

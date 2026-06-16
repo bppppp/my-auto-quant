@@ -12,7 +12,7 @@ from typing import Optional
 
 import pandas as pd
 
-from ._paths import DATA_ROOT
+from ._paths import FACTOR_DIR
 
 
 # ========== 全局因子缓存机制 ==========
@@ -56,7 +56,7 @@ def try_load_stock_factor(code: str, use_cache: bool = True) -> Optional[pd.Data
                 return _factor_cache[code]
 
     # 磁盘读取
-    path = DATA_ROOT / "data-by-stock-factor" / f"{code}_factor.csv"
+    path = FACTOR_DIR / f"{code}_factor.csv"
     if not path.exists():
         return None
     try:

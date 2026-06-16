@@ -124,7 +124,6 @@ D:\project\quant\my-quant3\
 │   ├── pipeline/                # 子包
 │   │   ├── config.py            # 配置
 │   │   ├── translator.py        # spec → code 翻译
-│   │   ├── test_runner.py       # 5 步测试
 │   │   ├── parser.py            # 报告解析
 │   │   ├── scorer.py            # 评分
 │   │   ├── state.py             # 进度持久化

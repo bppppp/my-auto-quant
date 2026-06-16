@@ -281,7 +281,7 @@ def _filter_eligible_codes(codes: list[str]) -> tuple[list[str], dict[str, int]]
         (filtered_codes, stats) - stats 含 4 个计数键
     """
     import pandas as pd
-    from subject.backtest.data_loader import DATA_ROOT
+    from subject.backtest.data_loader import STOCK_DIR, STOCK_FILE_SUFFIX
 
     stats = {
         "total": len(codes),
@@ -292,7 +292,7 @@ def _filter_eligible_codes(codes: list[str]) -> tuple[list[str], dict[str, int]]
         "filtered_missing": 0,
     }
     kept: list[str] = []
-    stock_dir = DATA_ROOT / "data-by-stock"
+    stock_dir = STOCK_DIR
 
     for code in codes:
         code6 = code.split(".")[0]
@@ -301,7 +301,7 @@ def _filter_eligible_codes(codes: list[str]) -> tuple[list[str], dict[str, int]]
             stats["filtered_prefix"] += 1
             continue
         # 规则 2/3: 读最新一行检查退市 & ST
-        f = stock_dir / f"{code6}_金玥数据.csv"
+        f = stock_dir / f"{code6}{STOCK_FILE_SUFFIX}"
         if not f.exists():
             stats["filtered_missing"] += 1
             continue
