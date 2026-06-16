@@ -646,6 +646,24 @@ def _is_bj(stock):
     return bare.startswith(("4", "8", "92"))
 
 
+def _cd_get(cd, stock):
+    """安全取 cd[stock], KeyError 时返回 None.
+
+    ⚠️ 2026-06-15 修复: JQ 平台 09:30 触发时, ``cd.get(s)`` 永远返回 None
+    (JQuantAPI.md §17.2 — lazy loading, .get() 不触发, dict 初始为空).
+    即使 ``set_universe(stock_list)`` 预填过, ``cd.get()`` 在首次访问仍 None.
+    真正可靠的模式是 ``cd[s] + try/except KeyError``.
+
+    Returns:
+        stock data object (含 .last_price/.high_limit/.low_limit/.paused/.is_st)
+        或 None (股票不在 cd 中, 例如停牌/退市/未上市).
+    """
+    try:
+        return cd[stock]
+    except KeyError:
+        return None
+
+
 def filter_universe(raw_list, context):
     """过滤候选池: 只剔除北交所.
     HS300 由 get_index_stocks 获取, 本身不包含北交所和 ST 股票, 这里只做兜底."""
@@ -812,7 +830,7 @@ def daily_handle(context):
         exit_sig = should_exit(f, h, prev_close, p)
         if exit_sig is None:
             continue
-        d = cd.get(stock)
+        d = _cd_get(cd, stock)
         if not can_sell_at_open(d, stock):
             log.info("%s 出场信号=%s 但 T 开盘无法卖出 (跌停/停牌), 延期" %
                      (stock, exit_sig))
@@ -890,7 +908,7 @@ def _do_rebalance(scores, factors_by_code, context):
         if stock in target_weights:
             continue
         h = g.holdings[stock]
-        d = cd.get(stock)
+        d = _cd_get(cd, stock)
         if not can_sell_at_open(d, stock):
             log.info("%s 调仓卖出但跌停/停牌, 延期" % stock)
             continue
@@ -900,7 +918,7 @@ def _do_rebalance(scores, factors_by_code, context):
     for stock, weight in target_weights.items():
         if stock in g.holdings:
             continue  # 已持仓, 不重新调整 (本地引擎不重平衡持仓 weight)
-        d = cd.get(stock)
+        d = _cd_get(cd, stock)
         if not can_buy_at_open(d, stock):
             log.info("%s 买入信号但 T 开盘无法买入" % stock)
             continue
@@ -935,7 +953,7 @@ def _compute_current_weights(context):
     total = 0.0
     cd = get_current_data()
     for stock, h in g.holdings.items():
-        d = cd.get(stock)
+        d = _cd_get(cd, stock)
         price = d.last_price if d and d.last_price > 0 else h.get("prev_close", h["entry_price"])
         value = h["shares"] * price
         out[stock] = value
@@ -952,7 +970,7 @@ def _compute_total_value(context):
     cd = get_current_data()
     tv = context.portfolio.available_cash
     for stock, h in g.holdings.items():
-        d = cd.get(stock)
+        d = _cd_get(cd, stock)
         price = d.last_price if d and d.last_price > 0 else h.get("prev_close", h["entry_price"])
         tv += h["shares"] * price
     return tv

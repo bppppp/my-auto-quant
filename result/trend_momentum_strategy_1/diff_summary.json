@@ -1,0 +1,46 @@
+{
+  "period": {
+    "jq_start": "2023-01-03",
+    "jq_end": "2026-06-12",
+    "local_start": "2023-01-01",
+    "local_end": "~2026-04-24"
+  },
+  "metrics": {
+    "jq": {
+      "final_cap": 921419.9999999999,
+      "total_pnl_pct": 207.14,
+      "cagr": 0.3858602456761935,
+      "sharpe": 1.4008007792070174,
+      "max_drawdown": -0.22240440742441137,
+      "n_tx": 866,
+      "n_buys": 448,
+      "n_sells": 418,
+      "n_unique_stocks": 174,
+      "win_rate_sell": 0.3803827751196172,
+      "total_commission": 9517.59,
+      "total_filled": 299162.4,
+      "avg_holding_days": 30.83050847457627,
+      "avg_position_pct": 0.9457537142264483
+    },
+    "local": {
+      "final_cap": 571139.4,
+      "total_pnl_pct": 90.38,
+      "cagr": 0.2132,
+      "sharpe": 1.56,
+      "max_drawdown": -0.2052,
+      "n_trades": 710,
+      "n_unique_stocks": 232,
+      "win_rate": 0.3944,
+      "pl_ratio": 1.38,
+      "avg_holding_days": 10.901408450704226
+    }
+  },
+  "universe": {
+    "config": 356,
+    "jq_traded": 174,
+    "local_traded": 232,
+    "overlap": 156,
+    "only_jq": 18,
+    "only_local": 76
+  }
+}

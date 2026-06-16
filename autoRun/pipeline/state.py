@@ -31,7 +31,9 @@ STAGE_PICKED_PARAMS = "picked_params"     # Stage D 完成
 STAGE_WEIGHT_LOOP = "weight_loop"         # Stage E 进行中
 STAGE_WEIGHT_DONE = "weight_done"         # Stage E 完成
 STAGE_PICKED_WEIGHT = "picked_weight"     # Stage F 完成
-STAGE_EXPORTED = "exported"               # Stage H 完成
+STAGE_PICKED_H = "picked_h"               # Stage H 完成 (2026-06-15 新增, JQ 未跑)
+STAGE_EXPORTED = "exported"               # Stage I 完成 (整个流水线结束)
+STAGE_JQ_FAILED = "jq_failed"             # Stage I 失败 (fail-soft, jq_status 标记, 不影响 exported)
 STAGE_FAILED = "failed"                   # 失败
 
 
@@ -51,6 +53,11 @@ class StrategyRecord:
     best_weight_score: float = float("-inf")
     failure_reason: str = ""
     completed_at: str = ""
+    # ⚠️ 2026-06-15 新增: Stage I 状态 (fail-soft, 不影响 exported)
+    jq_status: str = ""                    # "generated" / "failed" / ""
+    jq_code_path: str = ""                 # result/<name>/JQ_<name>.py
+    jq_attempts: int = 0
+    jq_failure_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -72,6 +79,10 @@ class StrategyRecord:
             best_weight_score=d.get("best_weight_score", float("-inf")),
             failure_reason=d.get("failure_reason", ""),
             completed_at=d.get("completed_at", ""),
+            jq_status=d.get("jq_status", ""),
+            jq_code_path=d.get("jq_code_path", ""),
+            jq_attempts=d.get("jq_attempts", 0),
+            jq_failure_reason=d.get("jq_failure_reason", ""),
         )
 
 
@@ -234,6 +245,8 @@ __all__ = [
     "STAGE_WEIGHT_DONE",
     "STAGE_PICKED_WEIGHT",
     "STAGE_EXPORTED",
+    "STAGE_JQ_GENERATED",
+    "STAGE_JQ_FAILED",
     "STAGE_FAILED",
     "StrategyRecord",
     "State",

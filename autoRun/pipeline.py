@@ -61,8 +61,10 @@ from autoRun.pipeline.state import (  # noqa: E402
     STAGE_EXPORTED,
     STAGE_FAILED,
     STAGE_GENERATED,
+    STAGE_JQ_FAILED,
     STAGE_PARAMS_DONE,
     STAGE_PARAMS_LOOP,
+    STAGE_PICKED_H,
     STAGE_PICKED_PARAMS,
     STAGE_PICKED_WEIGHT,
     STAGE_TRANSLATED,
@@ -73,6 +75,9 @@ from autoRun.pipeline.state import (  # noqa: E402
 from autoRun.pipeline.translator import (  # noqa: E402
     TranslationFailed,
     translate,
+)
+from autoRun.pipeline.jq_translator import (  # noqa: E402
+    generate_jq_script,
 )
 
 log = get_logger()
@@ -506,7 +511,12 @@ def run_stage_f_pick_best_weight(name: str, config: PipelineConfig, state: State
 # ========== Stage H: 导出到 result/ ==========
 
 def run_stage_h_export(name: str, config: PipelineConfig, state: State) -> None:
-    """Stage H: 3 个文件 copy 到 result/<name>/."""
+    """Stage H: 3 个文件 copy 到 result/<name>/.
+
+    ⚠️ 2026-06-15 调整: H 完后不再 mark_exported, 改 set_stage(STAGE_PICKED_H).
+    Stage I (JQ 脚本生成) 跑完后再统一 mark_exported. 这样支持断点续跑 (H 完后
+    中断, 下次从 I 继续).
+    """
     best_params = state.get(name).best_params_version
     best_weight = state.get(name).best_weight_version
     if not best_params or not best_weight:
@@ -520,14 +530,73 @@ def run_stage_h_export(name: str, config: PipelineConfig, state: State) -> None:
         result_dir=config.result_dir,
     )
     log.info(f"  → 已写入 {result.target_dir}/")
-    state.mark_exported(name)
+    state.set_stage(name, STAGE_PICKED_H)
     state.save()
+
+
+# ========== Stage I: 生成聚宽 JQ 脚本 (2026-06-15 新增) ==========
+
+def run_stage_i_jq(name: str, config: PipelineConfig, state: State) -> None:
+    """Stage I: 调 Claude Code 生成 result/<name>/JQ_<name>.py.
+
+    ⚠️ 2026-06-15 新增. fail-soft: 失败不抛异常, 仅记 jq_status=jq_failed.
+    Stage I 失败不影响 mark_exported (因为 H 已经成功导出, 策略本质可用).
+    """
+    final_md = config.result_dir / name / f"{name}_final.md"
+    report_weight_md = config.result_dir / name / "report_weight_final.md"
+    jq_output = config.result_dir / name / f"JQ_{name}.py"
+
+    if not final_md.exists():
+        log.warning(f"  ⚠️ {final_md} 不存在, 跳过 Stage I")
+        rec = state.get(name)
+        rec.jq_status = "failed"
+        rec.jq_failure_reason = f"final_md 不存在: {final_md}"
+        state.set_stage(name, STAGE_JQ_FAILED)
+        state.save()
+        return
+
+    try:
+        result = generate_jq_script(
+            name=name,
+            final_md_path=final_md,
+            report_weight_path=report_weight_md,
+            output_path=jq_output,
+            max_attempts=3,
+        )
+        rec = state.get(name)
+        rec.jq_code_path = str(jq_output)
+        rec.jq_attempts = result.attempts
+        if result.passed:
+            rec.jq_status = "generated"
+            rec.jq_failure_reason = ""
+            state.set_stage(name, STAGE_EXPORTED)  # 整个流水线结束
+            log.info(f"  ✅ Stage I 完成, 标记 exported")
+        else:
+            rec.jq_status = "failed"
+            rec.jq_failure_reason = result.failure_reason
+            state.set_stage(name, STAGE_JQ_FAILED)
+            log.warning(f"  ⚠️ Stage I 失败 (fail-soft, 不影响 exported 标记): {result.failure_reason[:200]}")
+            # ⚠️ fail-soft: 仍 mark_exported 让 has_pending 跳过, 但 jq_status 留下记录
+            state.set_stage(name, STAGE_EXPORTED)
+            log.info(f"  → 策略 {name} 标记 exported (JQ 失败仅作记录)")
+        state.save()
+    except Exception as e:
+        # Stage I 任何意外都 fail-soft
+        log.exception(f"Stage I 异常 (fail-soft): {e}")
+        rec = state.get(name)
+        rec.jq_status = "failed"
+        rec.jq_failure_reason = f"{type(e).__name__}: {e}"
+        state.set_stage(name, STAGE_EXPORTED)  # 仍 exported
+        state.save()
 
 
 # ========== Subprocess 辅助 ==========
 
 def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> None:
     """调 strategies.py 子命令 (generate/optimize/factor_weights/list).
+
+    ⚠️ 2026-06-15 精简: 不再实时回显每行 stdout (5 年 × 300 股刷几万行, 累积几个 G).
+    只在 exit 时报总输出大小, 失败时打 last 30 行. 调试用文件 log: autoRun/logs/pipeline_<date>.log.
 
     Args:
         timeout: 子进程超时秒数,None 表示不设超时 (依赖外部 Ctrl+C).
@@ -539,68 +608,54 @@ def run_cli(subcommand: str, args: list[str], timeout: int | None = 1800) -> Non
 
     proc = subprocess.Popen(
         cmd, cwd=project_root(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        shell=False, bufsize=1,
+        stdout=subprocess.DEVNULL,  # ⚠️ 2026-06-15: 丢弃 stdout, 避免刷屏
+        stderr=subprocess.DEVNULL,  # 同步丢弃 stderr
+        shell=False,
     )
     _register_subprocess(proc)
     try:
-        last_report = _time.time()
+        start_time = _time.time()
         deadline = _time.time() + timeout if timeout else float("inf")
-        chunks: list[str] = []
+        last_heartbeat = _time.time()
 
         while True:
             if _time.time() > deadline:
                 log.error(f"    ❌ {subcommand} 超时 ({timeout}s), 强杀")
                 proc.kill()
                 raise RuntimeError(f"{subcommand} 超时 {timeout}s")
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                chunks.append(line)
-                stripped = line.strip()
-                # 关键行实时打印
-                if any(kw in stripped.lower() for kw in ("loading", "optimize", "factor", "weight", "tune", "generate", "完成", "成功", "失败", "参数", "周期", "策略")):
-                    log.info(f"    | {stripped[:200]}")
-            if _time.time() - last_report > 300:
-                log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}")
-                last_report = _time.time()
-            if proc.poll() is not None:
-                if proc.stdout:
-                    rest = proc.stdout.read()
-                    if rest:
-                        chunks.append(rest)
-                break
-            _time.sleep(0.5)
 
-        full = "".join(chunks)
-        my_pid = proc.pid  # 记录 PID 防止误杀
-        # 显式 wait 回收 zombie
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                log.info(f"    → 清理 {subcommand} 进程 pid={my_pid}")
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            if proc.poll() is not None:
+                break
+
+            # 10 分钟一次心跳 (比之前 5min 减少一半, 减少日志量)
+            if _time.time() - last_heartbeat > 600:
+                elapsed = int(_time.time() - start_time)
+                log.info(f"    ⏳ {subcommand} 仍在跑, pid={proc.pid}, 已 {elapsed}s")
+                last_heartbeat = _time.time()
+            _time.sleep(1.0)  # 比 0.5s 省 CPU
+
+        elapsed = int(_time.time() - start_time)
         if proc.returncode != 0:
-            log.error(f"    ❌ {subcommand} exit {proc.returncode}, 最后 20 行:")
-            for ln in full.splitlines()[-20:]:
-                log.error(f"        {ln}")
-            raise RuntimeError(
-                f"{subcommand} exit {proc.returncode}\n"
-                f"STDOUT (tail 500):\n{full[-500:]}"
-            )
-        log.info(f"    ✅ {subcommand} 完成, 总输出 {len(full)} 字符")
+            log.error(f"    ❌ {subcommand} exit {proc.returncode}, 耗时 {elapsed}s")
+            raise RuntimeError(f"{subcommand} exit {proc.returncode}")
+        log.info(f"    ✅ {subcommand} 完成, 耗时 {elapsed}s")
     finally:
         _unregister_subprocess(proc)
-        _cleanup_stray_processes()  # 清理残留进程
+        # 确保进程被回收 (kill 已退出的不会报错)
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def run_backtest(name: str, mode: str, timeout: int | None = 1800,
                  start_date: str | None = None, end_date: str | None = None) -> None:
-    """调 subject.cli run 跑 backtest, 实时输出 stdout 到 log (避免长时间 subprocess 看不到 progress).
+    """调 subject.cli run 跑 backtest.
+
+    ⚠️ 2026-06-15 精简: 不再实时回显 stdout (回测 5 年 × 300 股会刷几万行).
+    完整 stdout 由 backtest 自己的 logger 写到 subjects/<name>/log/backtest_*.log.
 
     Args:
         timeout: 子进程超时秒数,None 表示不设超时.
@@ -609,14 +664,13 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800,
     """
     import time as _time
     cmd = [
-        sys.executable, "-u",  # unbuffered, 强制 print 行级 flush 到 pipe
+        sys.executable, "-u",  # unbuffered
         "-m", "subject.cli", "run",
         "--strategy", name,
         "--mode", mode,
     ]
     if mode == "weight":
         cmd += ["--weight-test", name]
-    # 传递日期范围，与 smoke test 保持一致
     if start_date:
         cmd += ["--start-date", start_date]
     if end_date:
@@ -624,20 +678,17 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800,
     timeout_str = f"{timeout}s" if timeout is not None else "无限制"
     log.info(f"    $ {' '.join(cmd)} (cwd=subjects/, timeout={timeout_str})")
 
-    # 用 Popen 实时读 stdout, 避免 capture_output=True 在长跑时把输出压到 return 时才释放
     proc = subprocess.Popen(
         cmd, cwd=subjects_dir(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # 合并 stderr 到 stdout
-        text=True, encoding="utf-8", errors="replace",
-        shell=False, bufsize=1,  # 行缓冲
+        stdout=subprocess.DEVNULL,  # ⚠️ 2026-06-15: 丢弃 stdout
+        stderr=subprocess.DEVNULL,  # 同步丢弃 stderr
+        shell=False,
     )
     _register_subprocess(proc)
     try:
-        log.info(f"    → backtest 进程 pid={proc.pid}")
-
-        last_progress_report = _time.time()
+        start_time = _time.time()
         deadline = _time.time() + timeout if timeout else float("inf")
-        stdout_chunks: list[str] = []
+        last_heartbeat = _time.time()
 
         while True:
             if _time.time() > deadline:
@@ -645,55 +696,28 @@ def run_backtest(name: str, mode: str, timeout: int | None = 1800,
                 proc.kill()
                 raise RuntimeError(f"backtest {mode} 超时 {timeout}s")
 
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                stdout_chunks.append(line)
-                # 关键行: 含 "loading", "backtest", "factor", "weight", "done", "%" 等
-                stripped = line.strip()
-                if any(kw in stripped.lower() for kw in ("loading", "backtest", "factor", "weight", "computing", "running", "完成", "report", "策略", "周期", "交易", "回测", "因子", "stock", "done", "%")):
-                    log.info(f"    | {stripped[:200]}")
-
-            # 5 分钟无新输出才报告 (减少日志量)
-            if _time.time() - last_progress_report > 300:
-                log.info(f"    ⏳ backtest 仍在跑, pid={proc.pid}, 已 {_time.time() - (deadline - timeout):.0f}s")
-                last_progress_report = _time.time()
-
             if proc.poll() is not None:
-                # 进程退出, 读完剩余
-                if proc.stdout:
-                    rest = proc.stdout.read()
-                    if rest:
-                        stdout_chunks.append(rest)
                 break
 
-            _time.sleep(0.5)
+            if _time.time() - last_heartbeat > 600:
+                elapsed = int(_time.time() - start_time)
+                log.info(f"    ⏳ backtest {mode} 仍在跑, pid={proc.pid}, 已 {elapsed}s")
+                last_heartbeat = _time.time()
+            _time.sleep(1.0)
 
-        full_output = "".join(stdout_chunks)
-        my_pid = proc.pid  # 记录 PID 防止误杀 (Popen 持有, 不影响外部进程)
-        # 显式 wait 回收 zombie 进程 (防止进程残留)
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                log.info(f"    → 清理 backtest 进程 pid={my_pid}")
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+        elapsed = int(_time.time() - start_time)
         if proc.returncode != 0:
-            # 打印最后 30 行帮诊断
-            last_lines = full_output.splitlines()[-30:]
-            log.error(f"    ❌ backtest {mode} exit {proc.returncode}, 最后 30 行输出:")
-            for ln in last_lines:
-                log.error(f"        {ln}")
-            raise RuntimeError(
-                f"backtest {mode} exit {proc.returncode}\n"
-                f"STDOUT (tail 500):\n{full_output[-500:]}"
-            )
-        log.info(f"    ✅ backtest 完成, exit=0, 总输出 {len(full_output)} 字符")
+            log.error(f"    ❌ backtest {mode} exit {proc.returncode}, 耗时 {elapsed}s")
+            raise RuntimeError(f"backtest {mode} exit {proc.returncode}")
+        log.info(f"    ✅ backtest {mode} 完成, 耗时 {elapsed}s")
     finally:
         _unregister_subprocess(proc)
-        _cleanup_stray_processes(name)  # 清理残留进程
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def parse_latest(name: str, mode: str) -> dict:
@@ -704,7 +728,7 @@ def parse_latest(name: str, mode: str) -> dict:
 
 # ========== 主循环 ==========
 
-STAGE_ORDER = ["A", "B", "C", "D", "E", "F", "H"]
+STAGE_ORDER = ["A", "B", "C", "D", "E", "F", "H", "I"]
 
 
 def main_loop(args, config: PipelineConfig) -> int:
@@ -724,9 +748,19 @@ def main_loop(args, config: PipelineConfig) -> int:
             # 从 state 恢复当前阶段（支持断点续跑）
             rec = state.get(strategy_name)
             if rec.stage in (STAGE_EXPORTED, STAGE_FAILED):
-                log.info(f"策略 {strategy_name} 已完成({rec.stage}), 跳过")
-                continue  # 跳过, batch_count 不增加, 等待下一策略或退出
-            start_stage = current_stage_letter(rec.stage)
+                # ⚠️ 2026-06-15: --strategy 单策略模式下, 已 exported = 已完成,
+                # **直接退出**而不是 continue (continue 会让 batch_count 不增加, 死循环)
+                log.info(f"策略 {strategy_name} 已完成({rec.stage}), 退出 (单策略模式)")
+                if rec.jq_status:
+                    log.info(f"  Stage I 状态: jq_status={rec.jq_status}, code={rec.jq_code_path}")
+                # 走强制退出路径
+                _kill_all_subprocesses()
+                os._exit(0)
+            # ⚠️ 2026-06-15: CLI --from-stage 显式覆盖 state 推断的 start_stage
+            # (之前 --from-stage 是死参数, 只在 docstring 里出现过)
+            start_stage = args.from_stage or current_stage_letter(rec.stage)
+            if args.from_stage:
+                log.info(f"  → CLI 覆盖: 从 Stage {args.from_stage} 开始 (state 推断: {current_stage_letter(rec.stage)})")
         elif state.has_pending():
             strategy_name = state.current_strategy or next_pending(state)
             start_stage = current_stage_letter(state.get(strategy_name).stage)
@@ -772,10 +806,18 @@ def main_loop(args, config: PipelineConfig) -> int:
             log.exception(f"Stage 失败: {e}")
             state.mark_failed(strategy_name, reason=f"{type(e).__name__}: {e}")
             state.save()  # 落盘: 同上
-            if not args.auto:
-                return 1
+            # ⚠️ 2026-06-15: 强制清理 + 强制退出 (原行为: 非 auto return 1, auto 隐式 return None — 都改成强制退出)
+            _kill_all_subprocesses()
+            os._exit(1)
 
     log.info(f"━━━ 批次完成: {batch_count} 个策略 ━━━")
+    # ⚠️ 2026-06-15: 强制清理子进程 + 立即退出, 防止 node/claude 子进程残留
+    # 让 Python 不走 atexit (避免 daemon 线程 / 句柄未释放卡住)
+    _force_exit_after_return = True
+    if _force_exit_after_return:
+        log.info("━━━ 清理子进程后立即退出 ━━━")
+        _kill_all_subprocesses()
+        os._exit(0)
     return 0
 
 
@@ -797,6 +839,8 @@ def run_one_stage(stage: str, name: str, config: PipelineConfig, state: State) -
         run_stage_f_pick_best_weight(name, config, state)
     elif stage == "H":
         run_stage_h_export(name, config, state)
+    elif stage == "I":
+        run_stage_i_jq(name, config, state)  # ⚠️ 2026-06-15 新增
     else:
         raise ValueError(f"未知 stage: {stage}")
 
@@ -819,6 +863,8 @@ def current_stage_letter(stage: str) -> str:
         "weight_loop": "E",
         "weight_done": "F",
         "picked_weight": "H",
+        "picked_h": "I",       # ⚠️ 2026-06-15 新增: H 完后进入 I
+        "jq_failed": "I",      # JQ 失败时续跑也跳到 I
         "exported": "Z",
         "failed": "Z",
     }
@@ -835,9 +881,11 @@ def maybe_exit_on_failures(args, n: int) -> int:
     log.info("   1. .env 中的 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL")
     log.info("   2. 最近 1-2 个 _original.md 是否合理")
     log.info("   3. 重跑: python pipeline.py --strategy <name> --from-stage B")
-    if args.auto:
-        return 1
-    return 2
+    # ⚠️ 2026-06-15: 强制清理 + 强制退出, 防止 claude/node 子进程残留
+    _kill_all_subprocesses()
+    code = 1 if args.auto else 2
+    os._exit(code)
+    return code  # 不可达, 仅 type-check
 
 
 # ========== check-env 子命令 ==========
@@ -914,7 +962,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 默认 (无子命令) 跑流水线
     parser.add_argument("--batch", type=int, default=None, help="一次跑几个策略 (覆盖 config)")
     parser.add_argument("--strategy", default=None, help="只跑指定策略")
-    parser.add_argument("--from-stage", default=None, choices=["A", "B", "C", "D", "E", "F", "H"], help="从某阶段开始")
+    parser.add_argument("--from-stage", default=None, choices=["A", "B", "C", "D", "E", "F", "H", "I"], help="从某阶段开始 (⚠️ 2026-06-15: 加上 I, 单独跑 Stage I)")
     parser.add_argument("--params-rounds", type=int, default=None, help="params 调优轮数 (覆盖 config)")
     parser.add_argument("--weight-rounds", type=int, default=None, help="weight 调优轮数 (覆盖 config)")
     parser.add_argument("--translate-max", type=int, default=None, help="翻译重试上限 (覆盖 config)")
@@ -998,7 +1046,14 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("\n⚠️ 用户中断 (KeyboardInterrupt), 正在退出...")
         _kill_all_subprocesses()
-        return 130
+        os._exit(130)  # 2026-06-15: 强制退出, 防止 claude/node 子进程残留
+    except Exception as e:
+        log.exception(f"❌ 未捕获异常: {e}")
+        _kill_all_subprocesses()
+        os._exit(1)  # 同样强制退出
+    # 兜底: 走到这里也强制退出
+    _kill_all_subprocesses()
+    os._exit(0)
 
 
 if __name__ == "__main__":

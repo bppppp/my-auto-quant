@@ -4,10 +4,13 @@ pipeline.log_utils — 统一日志
 - 控制台 + 文件双 handler
 - 文件位置: autoRun/logs/pipeline_<date>.log
 - 提供 banner / section / log_print 等便利函数
+
+⚠️ 2026-06-15 精简: 文件大小 50MB → 5MB, 保留份数 3 → 1, 减少历史日志堆积.
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +30,10 @@ _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _INITIALIZED = False
 
+# 文件大小上限 (5MB) + 保留份数 (1 份备份)
+MAX_LOG_SIZE = 5 * 1024 * 1024
+MAX_LOG_BACKUPS = 1
+
 
 def get_logger(name: str = "pipeline") -> logging.Logger:
     """获取 pipeline logger (单例)."""
@@ -43,21 +50,14 @@ def get_logger(name: str = "pipeline") -> logging.Logger:
     console.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     logger.addHandler(console)
 
-    # 文件
+    # 文件 — 5MB 轮转, 保留 1 份
     log_dir = auto_run_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today}.log"
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
-    logger.addHandler(file_handler)
-
-    # 实时 flush: FileHandler 换成行缓冲 subclass, 避免长 subprocess 期间看不到日志
-    # 日志文件大小限制 (50MB)，超过则轮转
-    MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
 
     class _RotatingFileHandler(logging.FileHandler):
-        """带大小限制的文件 handler，超过阈值则轮转（重命名为 .1, .2, ...）"""
+        """带大小限制的文件 handler，超过阈值则轮转（重命名为 .1, ...）"""
         def emit(self, record):
             try:
                 self._maybe_rotate()
@@ -76,26 +76,25 @@ def get_logger(name: str = "pipeline") -> logging.Logger:
                     pass
 
         def _rotate_log(self):
-            """轮转日志文件，最多保留 3 份备份"""
+            """轮转日志文件，最多保留 MAX_LOG_BACKUPS 份"""
             base = self.baseFilename
-            for i in range(3, 0, -1):
+            # 先删最老的备份
+            oldest = f"{base}.{MAX_LOG_BACKUPS}"
+            if os.path.exists(oldest):
+                try:
+                    os.unlink(oldest)
+                except Exception:
+                    pass
+            # 依次前移
+            for i in range(MAX_LOG_BACKUPS - 1, 0, -1):
                 old = f"{base}.{i}"
-                new = f"{base}.{i + 1}" if i < 3 else None
+                new = f"{base}.{i + 1}"
                 if os.path.exists(old):
-                    if new:
-                        try:
-                            os.rename(old, new)
-                        except Exception:
-                            try:
-                                os.unlink(old)
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            os.unlink(old)
-                        except Exception:
-                            pass
-            # 重命名当前日志为 .1
+                    try:
+                        os.rename(old, new)
+                    except Exception:
+                        pass
+            # 当前 → .1
             try:
                 os.rename(base, f"{base}.1")
             except Exception:

@@ -92,8 +92,8 @@ PARAMS = {
         "rsi_overbought_stop": 3.0,    # 优先级最高
         "trailing_stop": 0.5,
         "time_stop": 0.3,
-        "trend_reversal": 1e-8,         # 几乎禁用
-        "fixed_stop": 1e-8,             # 几乎禁用
+        "trend_reversal": 1e-8,         # 最低优先级, 仍触发 (兜底止损)
+        "fixed_stop": 1e-8,             # 最低优先级, 仍触发 (兜底止损)
     },
 
     # ---- tie-break random seed (与本地 rank_top_n seed=42 对齐) ----
@@ -396,14 +396,15 @@ def should_exit(factors, holding, current_price, p):
     按 exit_weights 降序遍历, 第一个触发的信号即返回 (短路).
     对应本地: strategy.should_exit + signals.prioritize_exit_signals.
 
-    **1e-8 真正禁用语义**: weight < 1e-6 的信号被跳过 (不被检查).
-    原因: sorted() 仍会按 1e-8 把这些信号排在最后, 但只要条件成立就
-    触发. final.md 里 trend_reversal / fixed_stop 的 weight = 1e-8
-    是"几乎禁用"的语义, 必须真正跳过才符合 spec.
+    **weight = 0 才是"禁用"语义**: weight == 0 的信号被跳过 (不被检查).
+    weight = 1e-8 仍会正常触发, 只是在 sorted() 中排在最后, 作为最低优先级兜底.
+    原因: sorted() 仍会按 1e-8 把这些信号排在最后, 只要条件成立就会触发.
+    final.md 里 trend_reversal / fixed_stop 的 weight = 1e-8 仅是"低优先级",
+    不应该被跳过 — 跳过会导致策略在 trend 反转 / 大幅亏损时无法及时止损.
     """
     exit_w = p["exit_weights"]
-    # 按 weight 降序排序信号名, 并过滤掉 weight < 1e-6 的"禁用"信号
-    active_sigs = [s for s, w in exit_w.items() if w >= 1e-6]
+    # weight == 0 才是真正"禁用"; 1e-8 等小数权重虽然优先级极低, 仍然参与触发
+    active_sigs = [s for s, w in exit_w.items() if w > 0]
     for sig in sorted(active_sigs, key=exit_w.get, reverse=True):
         if _check_exit_signal(sig, factors, holding, current_price, p):
             return sig
@@ -623,26 +624,6 @@ def _is_bj(stock):
     return bare.startswith(("4", "8", "92"))
 
 
-def _cd_get(cd, stock):
-    """安全取 cd[stock], KeyError 时返回 None.
-
-    ⚠️ 2026-06-15 修复: JQ 平台 09:30 触发时, ``cd.get(s)`` 永远返回 None
-    (JQuantAPI.md §17.2 — lazy loading, .get() 不触发, dict 初始为空).
-    即使 ``set_universe(stock_list)`` 预填过, ``cd.get()`` 在首次访问仍 None.
-    真正可靠的模式是 ``cd[s] + try/except KeyError``.
-    修复前 template/cd.get 在大多数场景能跑 (attribute_history 隐式触发过 lazy loading),
-    但**踩平台隐式行为边缘**, JQ 平台更新或时序变化时会炸.
-
-    Returns:
-        stock data object (含 .last_price/.high_limit/.low_limit/.paused/.is_st)
-        或 None (股票不在 cd 中, 例如停牌/退市/未上市).
-    """
-    try:
-        return cd[stock]
-    except KeyError:
-        return None
-
-
 def filter_universe(raw_list, context):
     """
     过滤候选池: 只剔除北交所. HS300 成员本身稳定 (大盘股, ST 极少, 都已上市 60+ 天).
@@ -823,7 +804,7 @@ def daily_handle(context):
         exit_sig = should_exit(f, h, prev_close, p)
         if exit_sig is None:
             continue
-        d = _cd_get(cd, stock)
+        d = cd.get(stock)
         if not can_sell_at_open(d, stock):
             log.info("%s 出场信号=%s 但 T 开盘无法卖出 (跌停/停牌), 延期" %
                      (stock, exit_sig))
@@ -905,7 +886,7 @@ def _do_rebalance(scores, factors_by_code, context):
         if stock in target_weights:
             continue
         h = g.holdings[stock]
-        d = _cd_get(cd, stock)
+        d = cd.get(stock)
         if not can_sell_at_open(d, stock):
             log.info("%s 调仓卖出但跌停/停牌, 延期" % stock)
             continue
@@ -915,7 +896,7 @@ def _do_rebalance(scores, factors_by_code, context):
     for stock, weight in target_weights.items():
         if stock in g.holdings:
             continue  # 已持仓, 不重新调整 (本地引擎不重平衡持仓 weight)
-        d = _cd_get(cd, stock)
+        d = cd.get(stock)
         if not can_buy_at_open(d, stock):
             log.info("%s 买入信号但 T 开盘无法买入" % stock)
             continue
@@ -951,7 +932,7 @@ def _compute_current_weights(context):
     total = 0.0
     cd = get_current_data()
     for stock, h in g.holdings.items():
-        d = _cd_get(cd, stock)
+        d = cd.get(stock)
         price = d.last_price if d and d.last_price > 0 else h.get("prev_close", h["entry_price"])
         value = h["shares"] * price
         out[stock] = value
@@ -968,7 +949,7 @@ def _compute_total_value(context):
     cd = get_current_data()
     tv = context.portfolio.available_cash
     for stock, h in g.holdings.items():
-        d = _cd_get(cd, stock)
+        d = cd.get(stock)
         price = d.last_price if d and d.last_price > 0 else h.get("prev_close", h["entry_price"])
         tv += h["shares"] * price
     return tv

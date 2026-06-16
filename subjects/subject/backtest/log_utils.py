@@ -1,8 +1,12 @@
 """回测日志工具. 见 subject.md §3 (数据格式) / subject_structure.md §5.
 
 提供双 handler logger:
-- FileHandler → subjects/{strategy_name}/log/backtest_{timestamp}.log (永久保存)
-- StreamHandler → console (实时观察)
+- FileHandler → subjects/{strategy_name}/log/backtest_{timestamp}.log (INFO 完整保存)
+- StreamHandler → console (WARNING 起, 避免 backtest 跑时刷屏)
+
+⚠️ 2026-06-15 调整: console handler 改 WARNING — 之前 INFO 会让 backtest 跑 300 只
+股票时刷几万行, 在 autoRun 流水线或重定向日志里累积几个 G. file handler 保持 INFO
+完整记录, 调试时去 subjects/<name>/log/backtest_*.log 看.
 
 日志格式: ``YYYY-MM-DD HH:MM:SS [LEVEL] message``
 """
@@ -16,6 +20,10 @@ from pathlib import Path
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# FileHandler 用 level (默认 INFO, 完整记录)
+# StreamHandler (console) 用 CONSOLE_LEVEL (默认 WARNING, 不刷屏)
+CONSOLE_LEVEL = logging.WARNING
+
 
 def setup_backtest_logger(
     strategy_name: str,
@@ -27,7 +35,7 @@ def setup_backtest_logger(
     Args:
         strategy_name: 策略目录名, 用于 logger 命名 + log 文件路径.
         subjects_dir: subjects 根目录 (含所有策略的目录), 一般为 ``Path(".")`` (cwd = subjects/).
-        level: 日志级别 (默认 INFO, 可改为 DEBUG).
+        level: 日志级别, 同时影响 file handler. 默认 INFO.
 
     Returns:
         (logger, log_file_path) 元组. log_file_path 可传给 report / 给用户提示.
@@ -48,15 +56,15 @@ def setup_backtest_logger(
 
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
-    # FileHandler
+    # FileHandler — INFO 完整保存 (调试时查)
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(level)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-    # StreamHandler (console)
+    # StreamHandler (console) — WARNING 起, 避免 backtest 跑 300 只股票刷屏
     ch = logging.StreamHandler()
-    ch.setLevel(level)
+    ch.setLevel(CONSOLE_LEVEL)
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
