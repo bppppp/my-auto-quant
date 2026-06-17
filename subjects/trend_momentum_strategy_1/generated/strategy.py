@@ -96,6 +96,37 @@ def _ema(series, span):
 
 class Strategy:
     def compute_factors(self, df, params):
+        # === 优先使用预计算因子 (data-by-stock-factor-bs) ===
+        try:
+            from subject.factors._cache import _factor_cache, _current_code, _current_date
+            import pandas as _pd
+            code = _current_code.get()
+            date = _current_date.get()
+            cached = _factor_cache.get(code)
+            if cached is not None and code and date is not None:
+                mask = cached["日期"] <= date
+                if mask.any():
+                    sub = cached[mask]
+                    close_s = sub["close"].astype(float)
+                    ema12 = close_s.ewm(span=12, adjust=False).mean()
+                    ema26 = close_s.ewm(span=26, adjust=False).mean()
+                    macd_l = ema12 - ema26
+                    macd_s = macd_l.ewm(span=9, adjust=False).mean()
+                    return {
+                        "ma_5": sub["ma_5"].astype(float),
+                        "ma_20": sub["ma_20"].astype(float),
+                        "ma_60": sub["ma_60"].astype(float),
+                        "atr_14": sub["atr_14"].astype(float),
+                        "rsi_14": sub["rsi_14"].astype(float),
+                        "macd_line": macd_l,
+                        "macd_signal": macd_s,
+                        "volume_ratio_20": sub["volume_ratio_20"].astype(float),
+                        "close": close_s,
+                    }
+        except Exception:
+            pass
+
+        # === fallback: 实时计算 ===
         close = df["收盘价"]
         high = df["最高价"]
         low = df["最低价"]
@@ -104,7 +135,6 @@ class Strategy:
         ema_26 = _ema(close, 26)
         macd_line = ema_12 - ema_26
         macd_signal = _ema(macd_line, 9)
-        # 直接用 pandas 计算, 绕过 subject.factors 里的 cache (cache 当前有错位 bug)
         vol_ma_20 = volume.rolling(window=20, min_periods=20).mean()
         return {
             "ma_5": close.rolling(window=5, min_periods=5).mean(),

@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-多指标共振趋势策略 - 严格 T-1 回测模式 (Local-Engine Equivalent)
+多指标共振趋势策略 - 标准前复权模式 (对齐本地 baostock 前复权数据)
 ==================================================================
 策略名称: trend_momentum_strategy_1
 策略文档: D:/my-auto-quant/result/trend_momentum_strategy_1/trend_momentum_strategy_1_final.md
 回测平台: JoinQuant (聚宽)
 
-本脚本严格按本地 weight 回测引擎 (subjects/subject/backtest/runner.py::_run_weight)
-的语义实现, 用于对齐本地与聚宽的回测结果:
+本脚本用于对齐本地 weight 回测引擎 (baostock 标准前复权) 与聚宽回测结果.
+与 template_trend_momentum_strategy_1.py 的唯一区别:
+
+  use_real_price = False  ← 使用标准前复权, 跟本地 baostock adjustflag='3' 对齐
 
 关键约定:
 1. **T-1 因子决策 + T 开盘成交**: 严格无前视
@@ -106,7 +108,10 @@ PARAMS = {
 # ============================================================
 def initialize(context):
     set_benchmark(PARAMS["benchmark"])
-    set_option("use_real_price", True)
+    # 使用标准前复权模式 (非动态复权).
+    # 与本地 baostock adjustflag='3' (前复权) 对齐, 避免 use_real_price=True
+    # 的动态复权导致历史价格与本地不一致.
+    set_option("use_real_price", False)
 
     # 手续费: 万 3 + 印花税千 1 (与本地引擎 calc_buy_fee/calc_sell_fee 对齐)
     set_order_cost(OrderCost(
