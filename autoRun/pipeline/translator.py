@@ -808,17 +808,15 @@ strategy.py 上次 smoke test 失败, 请诊断并修复。
         return False, str(code_path), {"failed_step": "claude_no_result", "feedback": "claude call produced no result"}
 
     # 验证 Claude 写出了 strategy.py
-    if not code_path.exists() or code_path.stat().st_size < 1000:
-        size = code_path.stat().st_size if code_path.exists() else 0
+    size = code_path.stat().st_size if code_path.exists() else 0
+    if size < 1000:
         log.error(f"  ❌ Claude 没写 strategy.py 或文件过小 (size={size})")
         log.error(f"     最后 20 行 stdout: ...{result.stdout[-1000:] if result.stdout else '(空)'}")
         log.error(f"     最后 500 字符 stderr: {result.stderr[-500:] if result.stderr else '(空)'}")
         return False, str(code_path), {"failed_step": "claude_no_code", "feedback": f"strategy.py size={size}, expected >1000"}
 
     # 验证 strategy.py 已生成且通过初步 syntax check
-    if size > 1000:
-        return True, str(code_path), {"metrics": {}}
-    return False, str(code_path), {"failed_step": "claude_no_code", "feedback": f"strategy.py size={size}, expected >1000"}
+    return True, str(code_path), {"metrics": {}}
 
 
 def translate(
