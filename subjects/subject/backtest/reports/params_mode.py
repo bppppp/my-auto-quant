@@ -64,6 +64,37 @@ def render_params_report(
         lines.append(f"| 股票数限制 | limit | {test_conditions.get('limit', '')} |")
         lines.append("")
 
+    # 效率与稳定性（平台无关指标 — 重点摘要）
+    lines.append("## 效率与稳定性")
+    lines.append("")
+    lines.append("| 中文名 | 英文名 | 值 |")
+    lines.append("|---|---|---|")
+    lines.append(f"| 平均每笔收益率 | avg_trade_return_pct | {metrics.avg_trade_return_pct:.2%} |")
+    lines.append(f"| 平均盈利 | avg_win_pct | {metrics.avg_win_pct:.2%} |")
+    lines.append(f"| 平均亏损 | avg_loss_pct | {metrics.avg_loss_pct:.2%} |")
+    lines.append(f"| 盈亏次数比 | win_loss_count_ratio | {metrics.win_loss_count_ratio:.2f} |")
+    lines.append(f"| 月胜率 | monthly_win_rate | {metrics.monthly_win_rate:.2%} |")
+    lines.append(f"| 最大连续盈利 | max_consecutive_wins | {metrics.max_consecutive_wins} |")
+    lines.append(f"| 最大连续亏损 | max_consecutive_losses | {metrics.max_consecutive_losses} |")
+    lines.append("")
+
+    # 收益率分桶分布
+    if hasattr(metrics, 'trade_return_dist') and metrics.trade_return_dist:
+        d = metrics.trade_return_dist
+        total = sum(d.values())
+        if total > 0:
+            lines.append("## 每笔收益率分布")
+            lines.append("")
+            lines.append("| 区间 | 笔数 | 占比 |")
+            lines.append("|---|---|---|")
+            lines.append(f"| 盈利 >10% | {d.get('win_10_plus', 0)} | {d.get('win_10_plus', 0)/total*100:.1f}% |")
+            lines.append(f"| 盈利 3%~10% | {d.get('win_3_10', 0)} | {d.get('win_3_10', 0)/total*100:.1f}% |")
+            lines.append(f"| 盈利 0~3% | {d.get('win_0_3', 0)} | {d.get('win_0_3', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 0~3% | {d.get('loss_0_3', 0)} | {d.get('loss_0_3', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 3%~10% | {d.get('loss_3_10', 0)} | {d.get('loss_3_10', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 >10% | {d.get('loss_10_plus', 0)} | {d.get('loss_10_plus', 0)/total*100:.1f}% |")
+            lines.append("")
+
     # Metrics（7 项，3 列：中文名 | 英文名 | 值）
     lines.append("## Metrics")
     lines.append("")
@@ -146,11 +177,21 @@ def render_params_report(
     # 调参依据
     lines.append("## 调参依据")
     lines.append("")
+    lines.append("### 传统指标")
+    lines.append("")
     lines.append("- 阈值在 p25 附近 → 偏严, 触发过少, 可考虑下调")
     lines.append("- 阈值远低于 p25 → 过松, 触发过多")
     lines.append("- p75 接近因子上限 → 触发集中在高值区, 阈值可能过严")
     lines.append("- `swallowed_count` 占比高 → 涨跌停日出场信号被吞多, 止损/止盈参数需调整")
     lines.append("- `skipped_count` 占比高 → A 股硬约束触发频繁, 相关过滤参数需调整")
+    lines.append("")
+    lines.append("### 效率与稳定性（平台无关）")
+    lines.append("")
+    lines.append("- 月胜率 < 40% → 策略过于依赖少数大盈单，稳定性差，考虑收紧入场条件")
+    lines.append("- 最大连续亏损 > 8 → 极端情况下账户压力大，考虑加强止损参数")
+    lines.append("- 亏损 3%~10% 占比 > 40% → 趋势反转信号可能延迟出场，考虑收紧 trailing_stop 或 time_stop")
+    lines.append("- 盈利 >10% 占比 < 10% → 策略抓不住大行情，考虑放宽止盈或延长持仓")
+    lines.append("- 平均亏损绝对值 > 平均盈利绝对值 → 盈亏比失衡，优先调整止损参数")
     lines.append("")
 
     if extra_notes:

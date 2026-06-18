@@ -62,6 +62,37 @@ def render_weight_report(
         lines.append(f"| weight_test | weight_test | {test_conditions.get('weight_test', '')} |")
         lines.append("")
 
+    # 效率与稳定性（平台无关指标 — 重点摘要）
+    lines.append("## 效率与稳定性")
+    lines.append("")
+    lines.append("| 中文名 | 英文名 | 值 |")
+    lines.append("|---|---|---|")
+    lines.append(f"| 平均每笔收益率 | avg_trade_return_pct | {metrics.avg_trade_return_pct:.2%} |")
+    lines.append(f"| 平均盈利 | avg_win_pct | {metrics.avg_win_pct:.2%} |")
+    lines.append(f"| 平均亏损 | avg_loss_pct | {metrics.avg_loss_pct:.2%} |")
+    lines.append(f"| 盈亏次数比 | win_loss_count_ratio | {metrics.win_loss_count_ratio:.2f} |")
+    lines.append(f"| 月胜率 | monthly_win_rate | {metrics.monthly_win_rate:.2%} |")
+    lines.append(f"| 最大连续盈利 | max_consecutive_wins | {metrics.max_consecutive_wins} |")
+    lines.append(f"| 最大连续亏损 | max_consecutive_losses | {metrics.max_consecutive_losses} |")
+    lines.append("")
+
+    # 收益率分桶分布
+    if hasattr(metrics, 'trade_return_dist') and metrics.trade_return_dist:
+        d = metrics.trade_return_dist
+        total = sum(d.values())
+        if total > 0:
+            lines.append("## 每笔收益率分布")
+            lines.append("")
+            lines.append("| 区间 | 笔数 | 占比 |")
+            lines.append("|---|---|---|")
+            lines.append(f"| 盈利 >10% | {d.get('win_10_plus', 0)} | {d.get('win_10_plus', 0)/total*100:.1f}% |")
+            lines.append(f"| 盈利 3%~10% | {d.get('win_3_10', 0)} | {d.get('win_3_10', 0)/total*100:.1f}% |")
+            lines.append(f"| 盈利 0~3% | {d.get('win_0_3', 0)} | {d.get('win_0_3', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 0~3% | {d.get('loss_0_3', 0)} | {d.get('loss_0_3', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 3%~10% | {d.get('loss_3_10', 0)} | {d.get('loss_3_10', 0)/total*100:.1f}% |")
+            lines.append(f"| 亏损 >10% | {d.get('loss_10_plus', 0)} | {d.get('loss_10_plus', 0)/total*100:.1f}% |")
+            lines.append("")
+
     # Metrics（7 项，3 列：中文名 | 英文名 | 值）
     lines.append("## Metrics")
     lines.append("")
@@ -172,11 +203,21 @@ def render_weight_report(
     # 调权依据
     lines.append("## 调权依据")
     lines.append("")
+    lines.append("### 传统指标")
+    lines.append("")
     lines.append("- 高 `win_rate` + 高 `avg_return` → 强势信号, 应增加权重")
     lines.append("- 低 `win_rate` 或负 `avg_return` → 弱势信号, 应降低权重")
     lines.append("- `return_share` 高 + `win_share` 高 → 强势信号, 应加权重")
     lines.append("- `loss_share` 显著高于 `win_share` → 弱势信号, 应降权重")
     lines.append("- `net_attribution` < 0 → 净拖累, 建议大幅降权或停用")
+    lines.append("")
+    lines.append("### 效率与稳定性（平台无关）")
+    lines.append("")
+    lines.append("- 月胜率 < 40% → 出场信号过于激进，优先降低止损/反转信号的 weight")
+    lines.append("- 最大连续亏损 > 8 → 趋势反转/固定止损信号权重过高，增加时间止盈或 RSI 出场权重对冲")
+    lines.append("- 亏损 3%~10% 占比 > 40% → trailing_stop 或 trend_reversal 权重过高，出场过早造成中等亏损堆积")
+    lines.append("- 盈利 >10% 占比 < 10% → 止盈信号权重过冲，出场过早限制了利润空间")
+    lines.append("- 平均亏损绝对值 > 平均盈利 → exit signals 整体权重大于 entry，考虑调升 entry weight 或降低 exit weight")
     lines.append("")
 
     return "\n".join(lines)

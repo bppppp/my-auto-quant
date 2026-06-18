@@ -1000,7 +1000,8 @@ class BacktestRunner:
                         sell_amount = open_px * pos.shares
                         pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
                         cumulative_pnl += pnl
-                        trades.append({"code": code, "pnl": pnl, "holding_days": pos.holding_days, "signal": exit_sig})
+                        pnl_pct = pnl / (pos.entry_price * pos.shares) if pos.entry_price > 0 and pos.shares > 0 else 0.0
+                        trades.append({"code": code, "pnl": pnl, "pnl_pct": pnl_pct, "holding_days": pos.holding_days, "signal": exit_sig})
                         events.append({"code": code, "signal": exit_sig, "action": "executed", "pnl": pnl, "holding_days": pos.holding_days})
                         if pos.entry_signals:
                             for sig_name in pos.entry_signals:
@@ -1064,7 +1065,8 @@ class BacktestRunner:
             # 期末 PnL 用 last_close 结算
             pnl = (last_close - pos.entry_price) * pos.shares - calc_sell_fee(last_close * pos.shares, code)
             cumulative_pnl += pnl
-            trades.append({"code": code, "pnl": pnl, "holding_days": pos.holding_days, "signal": "end_of_data"})
+            pnl_pct = pnl / (pos.entry_price * pos.shares) if pos.entry_price > 0 and pos.shares > 0 else 0.0
+            trades.append({"code": code, "pnl": pnl, "pnl_pct": pnl_pct, "holding_days": pos.holding_days, "signal": "end_of_data"})
             events.append({"code": code, "signal": "end_of_data", "action": "executed", "pnl": pnl, "holding_days": pos.holding_days})
             if pos.entry_signals:
                 for sig_name in pos.entry_signals:
@@ -1321,8 +1323,9 @@ class BacktestRunner:
                         sell_amount = open_px * pos.shares
                         pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
                         _, sold_pos = portfolio.sell(code, open_px, date)
+                        pnl_pct = pnl / (pos.entry_price * pos.shares) if pos.entry_price > 0 and pos.shares > 0 else 0.0
                         all_trades.append({
-                            "code": code, "pnl": pnl,
+                            "code": code, "pnl": pnl, "pnl_pct": pnl_pct,
                             "holding_days": pos.holding_days, "signal": exit_sig,
                         })
                         all_events.append({
@@ -1396,8 +1399,9 @@ class BacktestRunner:
                                     sell_amount = open_px * pos.shares
                                     pnl = (open_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
                                     _, sold_pos = portfolio.sell(code, open_px, date)
+                                    pnl_pct = pnl / (pos.entry_price * pos.shares) if pos.entry_price > 0 and pos.shares > 0 else 0.0
                                     all_trades.append({
-                                        "code": code, "pnl": pnl,
+                                        "code": code, "pnl": pnl, "pnl_pct": pnl_pct,
                                         "holding_days": pos.holding_days, "signal": "rebalance",
                                     })
                                     all_events.append({
@@ -1535,8 +1539,9 @@ class BacktestRunner:
                 sell_amount = close_px * pos.shares
                 pnl = (close_px - pos.entry_price) * pos.shares - calc_sell_fee(sell_amount, code)
                 _, sold_pos = portfolio.sell(code, close_px, end_date)
+                pnl_pct = pnl / (pos.entry_price * pos.shares) if pos.entry_price > 0 and pos.shares > 0 else 0.0
                 all_trades.append({
-                    "code": code, "pnl": pnl,
+                    "code": code, "pnl": pnl, "pnl_pct": pnl_pct,
                     "holding_days": pos.holding_days, "signal": "end_of_data",
                 })
                 all_events.append({

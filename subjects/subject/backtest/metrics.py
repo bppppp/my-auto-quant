@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,18 @@ class Metrics:
     profit_loss_ratio: float
     sharpe: float
     max_drawdown: float
+    # 平台无关的效率与稳定性指标（有默认值，向后兼容）
+    avg_trade_return_pct: float = 0.0
+    avg_win_pct: float = 0.0
+    avg_loss_pct: float = 0.0
+    win_loss_count_ratio: float = 0.0
+    monthly_win_rate: float = 0.0
+    max_consecutive_losses: int = 0
+    max_consecutive_wins: int = 0
+    trade_return_dist: dict = field(default_factory=lambda: {
+        "win_0_3": 0, "win_3_10": 0, "win_10_plus": 0,
+        "loss_0_3": 0, "loss_3_10": 0, "loss_10_plus": 0,
+    })
 
 
 def compute_metrics(
@@ -111,6 +123,75 @@ def compute_metrics(
         drawdowns = (daily_values - peaks) / peaks
     max_drawdown = float(drawdowns.min())  # 负数, 如 -0.15
 
+    # === 平台无关的效率与稳定性指标 ===
+
+    # 每笔收益率% (pnl_pct 由 runner 写入 trades)
+    if "pnl_pct" in trades.columns:
+        pnl_pcts = trades["pnl_pct"].dropna()
+    else:
+        pnl_pcts = pd.Series(dtype=float)
+
+    if len(pnl_pcts) > 0:
+        avg_trade_return_pct = float(pnl_pcts.mean())
+        win_pcts = pnl_pcts[pnl_pcts > 0]
+        loss_pcts = pnl_pcts[pnl_pcts < 0]
+        avg_win_pct = float(win_pcts.mean()) if len(win_pcts) > 0 else 0.0
+        avg_loss_pct = float(loss_pcts.mean()) if len(loss_pcts) > 0 else 0.0
+    else:
+        avg_trade_return_pct = 0.0
+        avg_win_pct = 0.0
+        avg_loss_pct = 0.0
+        win_pcts = pd.Series(dtype=float)
+        loss_pcts = pd.Series(dtype=float)
+
+    # 收益率分桶分布
+    trade_return_dist = {
+        "win_0_3": 0, "win_3_10": 0, "win_10_plus": 0,
+        "loss_0_3": 0, "loss_3_10": 0, "loss_10_plus": 0,
+    }
+    if len(pnl_pcts) > 0:
+        trade_return_dist["win_0_3"] = int(((pnl_pcts > 0) & (pnl_pcts <= 0.03)).sum())
+        trade_return_dist["win_3_10"] = int(((pnl_pcts > 0.03) & (pnl_pcts <= 0.10)).sum())
+        trade_return_dist["win_10_plus"] = int((pnl_pcts > 0.10).sum())
+        trade_return_dist["loss_0_3"] = int(((pnl_pcts < 0) & (pnl_pcts >= -0.03)).sum())
+        trade_return_dist["loss_3_10"] = int(((pnl_pcts < -0.03) & (pnl_pcts >= -0.10)).sum())
+        trade_return_dist["loss_10_plus"] = int((pnl_pcts < -0.10).sum())
+
+    # 盈亏次数比
+    if len(pnls) > 0:
+        n_wins = len(pnls[pnls > 0])
+        n_losses = len(pnls[pnls < 0])
+        win_loss_count_ratio = n_wins / n_losses if n_losses > 0 else 0.0
+    else:
+        win_loss_count_ratio = 0.0
+        n_wins = 0
+        n_losses = 0
+
+    # 月胜率
+    monthly_win_rate = 0.0
+    if len(daily_values) >= 20:  # 至少 20 个交易日 (~1 个月) 才有意义
+        monthly_end = daily_values.resample("ME").last().dropna()
+        if len(monthly_end) >= 1:
+            monthly_ret = monthly_end.pct_change().dropna()
+            if len(monthly_ret) > 0:
+                monthly_win_rate = float((monthly_ret > 0).sum() / len(monthly_ret))
+
+    # 最大连续盈利/亏损笔数
+    max_consecutive_wins = 0
+    max_consecutive_losses = 0
+    cur_wins = 0
+    cur_losses = 0
+    for p in pnls:
+        if p > 0:
+            cur_wins += 1
+            cur_losses = 0
+            max_consecutive_wins = max(max_consecutive_wins, cur_wins)
+        elif p < 0:
+            cur_losses += 1
+            cur_wins = 0
+            max_consecutive_losses = max(max_consecutive_losses, cur_losses)
+        # p == 0: 不改变连胜/连亏
+
     return Metrics(
         annual_return=float(annual_return),
         avg_annual_return_rate=float(avg_annual_return_rate),
@@ -119,4 +200,12 @@ def compute_metrics(
         profit_loss_ratio=float(profit_loss_ratio),
         sharpe=float(sharpe),
         max_drawdown=float(max_drawdown),
+        avg_trade_return_pct=avg_trade_return_pct,
+        avg_win_pct=avg_win_pct,
+        avg_loss_pct=avg_loss_pct,
+        win_loss_count_ratio=win_loss_count_ratio,
+        monthly_win_rate=monthly_win_rate,
+        max_consecutive_losses=max_consecutive_losses,
+        max_consecutive_wins=max_consecutive_wins,
+        trade_return_dist=trade_return_dist,
     )
